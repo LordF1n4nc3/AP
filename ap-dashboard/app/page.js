@@ -12,12 +12,57 @@ import {
   formatCurrency,
   formatPercent,
 } from './lib/parsers';
+import { supabase } from './lib/supabase';
 
 function AppContent() {
   const { state, dispatch } = useApp();
   const [currentPage, setCurrentPage] = useState('dashboard');
   const [selectedClient, setSelectedClient] = useState(null);
   const [clientTab, setClientTab] = useState('overview');
+
+  // Auth State
+  const [session, setSession] = useState(null);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [isSignUp, setIsSignUp] = useState(false);
+
+  // Subscribe to Auth status
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const handleAuth = async (e) => {
+    e.preventDefault();
+    setAuthLoading(true);
+    setAuthError('');
+    if (isSignUp) {
+      const { error } = await supabase.auth.signUp({ email: authEmail, password: authPassword });
+      if (error) setAuthError(error.message);
+      else setAuthError('¡Chequeá tu email para confirmar la cuenta!');
+    } else {
+      const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
+      if (error) setAuthError('Email o contraseña incorrectos');
+    }
+    setAuthLoading(false);
+  };
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+  };
+
+  const isAdmin = session?.user?.email?.toLowerCase() === 'caneignacio@gmail.com';
 
   const clients = Object.values(state.clients);
 
@@ -87,6 +132,77 @@ function AppContent() {
     setClientTab('overview');
   };
 
+  if (!session) {
+    return (
+      <div style={{ display: 'flex', height: '100vh', alignItems: 'center', justifyContent: 'center', backgroundColor: 'var(--bg-color)' }}>
+        <div style={{ padding: '40px', backgroundColor: 'var(--panel-bg)', borderRadius: '16px', border: '1px solid var(--border-color)', width: '360px', textAlign: 'center' }}>
+          <div className="sidebar-logo" style={{ justifyContent: 'center', marginBottom: '32px' }}>
+            <div className="sidebar-logo-icon">RC</div>
+            <div className="sidebar-logo-text" style={{ textAlign: 'left' }}>
+              <span className="sidebar-logo-title">RC Partners</span>
+              <span className="sidebar-logo-subtitle">Portal de Inversores</span>
+            </div>
+          </div>
+
+          <form onSubmit={handleAuth} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            <input
+              type="email"
+              placeholder="Email"
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+              required
+              className="search-input"
+              style={{ padding: '12px' }}
+            />
+            <input
+              type="password"
+              placeholder="Contraseña"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              required
+              className="search-input"
+              style={{ padding: '12px' }}
+            />
+            <button
+              type="submit"
+              className="btn btn-primary"
+              disabled={authLoading}
+              style={{ padding: '12px', justifyContent: 'center', marginTop: '8px' }}
+            >
+              {authLoading ? 'Cargando...' : isSignUp ? 'Crear Cuenta' : 'Ingresar'}
+            </button>
+          </form>
+
+          {authError && <p style={{ color: 'var(--text-negative)', marginTop: '16px', fontSize: '14px' }}>{authError}</p>}
+
+          <button
+            type="button"
+            onClick={() => { setIsSignUp(!isSignUp); setAuthError(''); }}
+            style={{ marginTop: '24px', background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '13px' }}
+          >
+            {isSignUp ? '¿Ya tenés cuenta? Ingresá' : 'Crear una nueva cuenta'}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // If not admin, force them to client detail view for now
+  // We will need to map their email to an account later.
+  if (!isAdmin) {
+    return (
+      <div className="app-layout">
+        <main className="main-content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+            <h2>¡Hola, {session.user.email}!</h2>
+            <p>Tu cuenta de inversión está siendo verificada y vinculada por RC Partners.</p>
+            <button onClick={handleLogout} className="btn" style={{ marginTop: '24px' }}>Cerrar sesión</button>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="app-layout">
       {/* Sidebar */}
@@ -138,8 +254,16 @@ function AppContent() {
         </nav>
 
         <div style={{ padding: '16px 12px', borderTop: '1px solid var(--border-color)' }}>
-          <div style={{ fontSize: '11px', color: 'var(--text-muted)', textAlign: 'center' }}>
-            Datos al {new Date().toLocaleDateString('es-AR')}
+          <button
+            onClick={handleLogout}
+            className="nav-item"
+            style={{ width: '100%', justifyContent: 'flex-start', color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer' }}
+          >
+            <span className="nav-icon">🚪</span>
+            Cerrar Sesión
+          </button>
+          <div style={{ fontSize: '11px', color: 'var(--text-muted)', textAlign: 'center', marginTop: '12px' }}>
+            <div>v0.3.5 • Conectado a Vercel</div>
           </div>
         </div>
       </aside>
