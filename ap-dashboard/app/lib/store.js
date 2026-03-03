@@ -12,7 +12,10 @@ const initialState = {
     cclRate: null,     // current USD CCL rate (venta)
     ratesHistory: {},  // { 'YYYY-MM-DD': { mep: { compra, venta }, ccl: { compra, venta } } }
     ratesLastFetch: null, // ISO timestamp of last fetch
+    dbLoaded: false,   // Flag to know if cloud data is loaded
 };
+
+import { supabase } from './supabase';
 
 function reducer(state, action) {
     switch (action.type) {
@@ -105,7 +108,10 @@ function reducer(state, action) {
             return { ...state, toasts: state.toasts.filter(t => t.id !== action.payload) };
 
         case 'LOAD_STATE':
-            return { ...action.payload, toasts: [] };
+            return { ...state, ...action.payload, toasts: [] };
+
+        case 'MARK_DB_LOADED':
+            return { ...state, dbLoaded: true };
 
         default:
             return state;

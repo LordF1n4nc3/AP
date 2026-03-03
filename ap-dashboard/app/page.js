@@ -592,6 +592,42 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, usd
   // Color palette for holdings
   const holdingColors = ['#6366f1', '#8b5cf6', '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#ec4899', '#14b8a6'];
 
+  const [savingLoading, setSavingLoading] = useState(false);
+  const [assignedEmail, setAssignedEmail] = useState(client.assignedEmail || '');
+
+  const saveToCloud = async () => {
+    setSavingLoading(true);
+    try {
+      // 1. Update/Upsert in 'clientes' table
+      const { error: clientError } = await supabase
+        .from('clientes')
+        .upsert({
+          cuenta: client.accountNumber,
+          nombre: client.name,
+          email_asignado: assignedEmail || null
+        }, { onConflict: 'cuenta' });
+
+      if (clientError) throw clientError;
+
+      // 2. Update/Upsert in 'datos_financieros' table
+      const { error: dataError } = await supabase
+        .from('datos_financieros')
+        .upsert({
+          cuenta: client.accountNumber,
+          datos_json: client
+        }, { onConflict: 'cuenta' });
+
+      if (dataError) throw dataError;
+
+      dispatch({ type: 'ADD_TOAST', payload: { type: 'success', title: '¡Guardado!', message: 'Datos respaldados en la nube.' } });
+    } catch (err) {
+      console.error(err);
+      dispatch({ type: 'ADD_TOAST', payload: { type: 'error', title: 'Error', message: 'No se pudo guardar en Supabase.' } });
+    } finally {
+      setSavingLoading(false);
+    }
+  };
+
   return (
     <>
       <div className="page-header">
@@ -609,6 +645,32 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, usd
             </div>
           </div>
           <CurrencySelector currency={currency} dispatch={dispatch} />
+        </div>
+      </div>
+
+      <div className="card" style={{ marginBottom: '24px', backgroundColor: 'rgba(99, 102, 241, 0.05)', border: '1px solid var(--color-primary)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '16px' }}>
+          <div>
+            <h3 style={{ fontSize: '14px', marginBottom: '4px' }}>☁️ Conexión a Nube (Portal de Inversores)</h3>
+            <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Asigná el email del cliente para que pueda ver esta cuenta en su celular.</p>
+          </div>
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+            <input
+              type="email"
+              placeholder="Email del cliente (ej: juan@gmail.com)"
+              value={assignedEmail}
+              onChange={(e) => setAssignedEmail(e.target.value)}
+              className="search-input"
+              style={{ width: '250px' }}
+            />
+            <button
+              onClick={saveToCloud}
+              className="btn btn-primary"
+              disabled={savingLoading}
+            >
+              {savingLoading ? 'Guardando...' : 'Sincronizar a Nube'}
+            </button>
+          </div>
         </div>
       </div>
 
