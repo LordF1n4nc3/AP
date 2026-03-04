@@ -243,6 +243,15 @@ function AppContent() {
             Cargar Archivos
           </button>
 
+          <span className="sidebar-section-title">Mercado</span>
+          <button
+            className={`nav-item ${currentPage === 'mercado' ? 'active' : ''}`}
+            onClick={() => setCurrentPage('mercado')}
+          >
+            <span className="nav-icon">📈</span>
+            Mercado IOL
+          </button>
+
           <span className="sidebar-section-title">Configuración</span>
           <button
             className={`nav-item ${currentPage === 'settings' ? 'active' : ''}`}
@@ -290,6 +299,7 @@ function AppContent() {
           />
         )}
         {currentPage === 'upload' && <UploadPage dispatch={dispatch} clients={clients} />}
+        {currentPage === 'mercado' && <MercadoPage />}
         {currentPage === 'settings' && <SettingsPage state={state} dispatch={dispatch} />}
       </main>
 
@@ -1408,6 +1418,287 @@ function CurrencySelector({ currency, dispatch }) {
         CCL
       </button>
     </div>
+  );
+}
+
+// ===================================================
+// MERCADO IOL PAGE
+// ===================================================
+function MercadoPage() {
+  const [activeTab, setActiveTab] = useState('bonos');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [requestCount, setRequestCount] = useState(0);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [search, setSearch] = useState('');
+  const [sortField, setSortField] = useState('simbolo');
+  const [sortDir, setSortDir] = useState('asc');
+
+  // Data for each tab
+  const [bonos, setBonos] = useState([]);
+  const [acciones, setAcciones] = useState([]);
+  const [letras, setLetras] = useState([]);
+  const [ons, setOns] = useState([]);
+  const [cedears, setCedears] = useState([]);
+
+  const tabConfig = {
+    bonos: { label: 'Bonos', action: 'panel_bonos', data: bonos, setData: setBonos },
+    acciones: { label: 'Acciones', action: 'panel_acciones', data: acciones, setData: setAcciones },
+    letras: { label: 'Letras', action: 'panel_letras', data: letras, setData: setLetras },
+    ons: { label: 'ONs', action: 'panel_obligaciones', data: ons, setData: setOns },
+    cedears: { label: 'CEDEARs', action: 'panel_cedears', data: cedears, setData: setCedears },
+  };
+
+  const fetchPanel = async (tabKey) => {
+    const config = tabConfig[tabKey];
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch('/api/iol', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: config.action }),
+      });
+      const json = await res.json();
+      if (json.error) throw new Error(json.error);
+      const items = json.data?.titulos || json.data || [];
+      config.setData(Array.isArray(items) ? items : []);
+      setRequestCount(json.requestCount || 0);
+      setLastUpdate(new Date().toLocaleTimeString('es-AR'));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const currentData = tabConfig[activeTab]?.data || [];
+
+  // Search filter
+  const filtered = currentData.filter(item => {
+    if (!search) return true;
+    const q = search.toLowerCase();
+    const sym = (item.simbolo || item.symbol || '').toLowerCase();
+    const desc = (item.descripcion || item.description || '').toLowerCase();
+    return sym.includes(q) || desc.includes(q);
+  });
+
+  // Sort
+  const sorted = [...filtered].sort((a, b) => {
+    const aVal = a[sortField] ?? '';
+    const bVal = b[sortField] ?? '';
+    if (typeof aVal === 'number' && typeof bVal === 'number') {
+      return sortDir === 'asc' ? aVal - bVal : bVal - aVal;
+    }
+    return sortDir === 'asc'
+      ? String(aVal).localeCompare(String(bVal))
+      : String(bVal).localeCompare(String(aVal));
+  });
+
+  const handleSort = (field) => {
+    if (sortField === field) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortField(field);
+      setSortDir('asc');
+    }
+  };
+
+  const sortIcon = (field) => sortField === field ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+
+  const fmtNum = (n) => {
+    if (n === null || n === undefined || n === '') return '-';
+    return Number(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  };
+
+  const fmtPct = (n) => {
+    if (n === null || n === undefined || n === '') return '-';
+    const v = Number(n);
+    return (
+      <span style={{ color: v >= 0 ? 'var(--color-success)' : 'var(--color-danger)' }}>
+        {v >= 0 ? '+' : ''}{v.toFixed(2)}%
+      </span>
+    );
+  };
+
+  const requestPct = ((requestCount / 20000) * 100).toFixed(1);
+
+  return (
+    <>
+      <div className="page-header">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px' }}>
+          <div>
+            <h1>📈 Mercado IOL</h1>
+            <p style={{ fontSize: '14px', color: 'var(--text-muted)' }}>Datos de mercado en tiempo real vía InvertirOnline API</p>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+            <div style={{
+              background: 'var(--bg-card)',
+              borderRadius: '8px',
+              padding: '8px 16px',
+              border: '1px solid var(--border-color)',
+              fontSize: '12px',
+              textAlign: 'center',
+            }}>
+              <div style={{ color: 'var(--text-muted)', marginBottom: '2px' }}>Requests este mes</div>
+              <div style={{
+                fontWeight: 700,
+                fontSize: '16px',
+                color: requestCount > 18000 ? 'var(--color-danger)' : requestCount > 15000 ? 'var(--color-warning)' : 'var(--color-success)',
+              }}>
+                {requestCount.toLocaleString()} / 20.000
+              </div>
+              <div style={{
+                width: '100%',
+                height: '4px',
+                background: 'var(--bg-secondary)',
+                borderRadius: '2px',
+                marginTop: '4px',
+                overflow: 'hidden',
+              }}>
+                <div style={{
+                  width: `${Math.min(requestPct, 100)}%`,
+                  height: '100%',
+                  background: requestCount > 18000 ? 'var(--color-danger)' : requestCount > 15000 ? '#f59e0b' : 'var(--color-success)',
+                  borderRadius: '2px',
+                  transition: 'width 0.5s ease',
+                }} />
+              </div>
+            </div>
+            <button
+              onClick={() => fetchPanel(activeTab)}
+              disabled={loading}
+              className="btn btn-primary"
+              style={{ padding: '10px 20px', fontSize: '14px' }}
+            >
+              {loading ? '⏳ Cargando...' : '🔄 Actualizar'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {lastUpdate && (
+        <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px' }}>
+          Última actualización: {lastUpdate}
+        </div>
+      )}
+
+      {error && (
+        <div style={{
+          background: 'rgba(239, 68, 68, 0.1)',
+          border: '1px solid var(--color-danger)',
+          borderRadius: '8px',
+          padding: '12px 16px',
+          marginBottom: '16px',
+          color: 'var(--color-danger)',
+          fontSize: '14px',
+        }}>
+          ⚠️ {error}
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div className="tabs" style={{ marginBottom: '16px' }}>
+        {Object.keys(tabConfig).map(key => (
+          <button
+            key={key}
+            className={`tab ${activeTab === key ? 'active' : ''}`}
+            onClick={() => { setActiveTab(key); setSearch(''); }}
+          >
+            {tabConfig[key].label}
+            {tabConfig[key].data.length > 0 && (
+              <span style={{ marginLeft: '6px', fontSize: '11px', opacity: 0.6 }}>
+                ({tabConfig[key].data.length})
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* Search */}
+      <div style={{ marginBottom: '16px' }}>
+        <input
+          type="text"
+          placeholder="🔍 Buscar por ticker o descripción..."
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          className="search-input"
+          style={{ maxWidth: '400px' }}
+        />
+      </div>
+
+      {/* Table */}
+      <div className="card">
+        {sorted.length === 0 && !loading ? (
+          <div className="empty-state">
+            <div className="empty-state-icon">📊</div>
+            <div className="empty-state-title">
+              {currentData.length === 0 ? 'Sin datos' : 'Sin resultados'}
+            </div>
+            <div className="empty-state-text">
+              {currentData.length === 0
+                ? 'Apretá el botón "🔄 Actualizar" para traer los datos del mercado.'
+                : `No se encontraron títulos para "${search}"`
+              }
+            </div>
+          </div>
+        ) : (
+          <div className="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ cursor: 'pointer' }} onClick={() => handleSort('simbolo')}>
+                    Ticker{sortIcon('simbolo')}
+                  </th>
+                  <th style={{ cursor: 'pointer' }} onClick={() => handleSort('descripcion')}>
+                    Descripción{sortIcon('descripcion')}
+                  </th>
+                  <th className="text-right" style={{ cursor: 'pointer' }} onClick={() => handleSort('ultimoPrecio')}>
+                    Último{sortIcon('ultimoPrecio')}
+                  </th>
+                  <th className="text-right" style={{ cursor: 'pointer' }} onClick={() => handleSort('variacionPorcentual')}>
+                    Var %{sortIcon('variacionPorcentual')}
+                  </th>
+                  <th className="text-right" style={{ cursor: 'pointer' }} onClick={() => handleSort('apertura')}>
+                    Apertura{sortIcon('apertura')}
+                  </th>
+                  <th className="text-right" style={{ cursor: 'pointer' }} onClick={() => handleSort('maximo')}>
+                    Máximo{sortIcon('maximo')}
+                  </th>
+                  <th className="text-right" style={{ cursor: 'pointer' }} onClick={() => handleSort('minimo')}>
+                    Mínimo{sortIcon('minimo')}
+                  </th>
+                  <th className="text-right" style={{ cursor: 'pointer' }} onClick={() => handleSort('volumen')}>
+                    Volumen{sortIcon('volumen')}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map((item, idx) => (
+                  <tr key={item.simbolo || idx}>
+                    <td>
+                      <span className="ticker-tag">{item.simbolo || item.symbol || '-'}</span>
+                    </td>
+                    <td style={{ fontSize: '12px', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {item.descripcion || item.description || '-'}
+                    </td>
+                    <td className="text-right text-bold">{fmtNum(item.ultimoPrecio)}</td>
+                    <td className="text-right">{fmtPct(item.variacionPorcentual)}</td>
+                    <td className="text-right">{fmtNum(item.apertura)}</td>
+                    <td className="text-right">{fmtNum(item.maximo)}</td>
+                    <td className="text-right">{fmtNum(item.minimo)}</td>
+                    <td className="text-right">{fmtNum(item.volumen)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--text-muted)', textAlign: 'right' }}>
+        {sorted.length > 0 && `Mostrando ${sorted.length} de ${currentData.length} títulos`}
+      </div>
+    </>
   );
 }
 
