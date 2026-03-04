@@ -1449,6 +1449,20 @@ function MercadoPage() {
     cedears: { label: 'CEDEARs', action: 'panel_cedears', data: cedears, setData: setCedears },
   };
 
+  // Load persistent request count on mount (does NOT call IOL API)
+  useEffect(() => {
+    fetch('/api/iol', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'get_request_count' }),
+    })
+      .then(r => r.json())
+      .then(json => {
+        if (json.requestCount !== undefined) setRequestCount(json.requestCount);
+      })
+      .catch(() => { });
+  }, []);
+
   const fetchPanel = async (tabKey) => {
     const config = tabConfig[tabKey];
     setLoading(true);
