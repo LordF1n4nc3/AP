@@ -12,7 +12,11 @@ export function parseTenenciaPDF(textContent) {
     const lines = text.replace(/\s+/g, ' ').trim();
 
     // Extract date - format: dd/m/yyyy or dd/mm/yyyy
-    const dateMatch = lines.match(/(\d{1,2}\/\d{1,2}\/\d{4})/);
+    // IMPORTANT: Look specifically for "Fecha Estado de Cta" first (IOL specific),
+    // otherwise fall back to the first date found in the text.
+    const specificDateMatch = lines.match(/Fecha\s+Estado\s+(?:de\s+)?Cta[.:]*\s*(\d{1,2}\/\d{1,2}\/\d{4})/i);
+    const genericDateMatch = lines.match(/(\d{1,2}\/\d{1,2}\/\d{4})/);
+    const dateMatch = specificDateMatch || genericDateMatch;
     const reportDate = dateMatch ? dateMatch[1] : null;
 
     // Extract account numbers - the two numbers after the date
@@ -340,28 +344,32 @@ function parseArgDate(str) {
  * If exact date doesn't exist, finds the closest previous date.
  * Returns { mep: { compra, venta }, ccl: { compra, venta } } or null.
  */
-function getRateForDate(ratesHistory, dateStr) {
+export function getRateForDate(ratesHistory, dateStr) {
     if (!ratesHistory || Object.keys(ratesHistory).length === 0) return null;
+    if (!dateStr) return null;
     if (ratesHistory[dateStr]) return ratesHistory[dateStr];
-    const dates = Object.keys(ratesHistory).sort();
-    let closest = null;
-    for (const d of dates) {
-        if (d <= dateStr) closest = d;
-        else break;
+
+    const candidateDates = Object.keys(ratesHistory)
+        .filter(date => date <= dateStr)
+        .sort()
+        .reverse();
+
+    return candidateDates.length > 0 ? ratesHistory[candidateDates[0]] : null;
+}
+
+/** 
+ * Extract MEP rate using the Midpoint (Promedio Compra/Venta)
+ * This avoids the artificial spread distortion from pricing APIs.
+ */
+export function getMepRate(rate) {
+    if (!rate) return null;
+    const mep = rate.mep || {};
+    // If it has both, calculate Midpoint
+    if (mep.compra && mep.venta) {
+        return (mep.compra + mep.venta) / 2;
     }
-    return closest ? ratesHistory[closest] : null;
-}
-
-/** Extract MEP venta rate from a rate object */
-function getMepVenta(rate) {
-    if (!rate) return null;
-    return rate.mep?.venta || rate.mepVenta || null;
-}
-
-/** Extract MEP compra rate from a rate object */
-function getMepCompra(rate) {
-    if (!rate) return null;
-    return rate.mep?.compra || rate.mepCompra || null;
+    // Fallbacks
+    return mep.venta || mep.compra || rate.mepVenta || rate.mepCompra || null;
 }
 
 /**
@@ -374,12 +382,12 @@ function getSnapshotValueInCurrency(snapshot, currency, ratesHistory) {
     const usdCash = snapshot.availableDolares || 0;
     if (currency === 'USD') {
         const rate = getRateForDate(ratesHistory, snapshot.date);
-        const mepRate = getMepVenta(rate) || 1;
+        const mepRate = getMepRate(rate) || 1;
         return mepRate > 0 ? (arsValue / mepRate) + usdCash : arsValue + usdCash;
     }
     // ARS mode
     const rate = getRateForDate(ratesHistory, snapshot.date);
-    const mepRate = getMepCompra(rate) || getMepVenta(rate) || 1;
+    const mepRate = getMepRate(rate) || 1;
     return arsValue + (usdCash * mepRate);
 }
 
@@ -391,12 +399,12 @@ function getFlowAmountInCurrency(flow, currency, ratesHistory) {
     const flowDate = flow.concertDate;
     if (flow.moneda === 'ARS' && currency === 'USD') {
         const rate = getRateForDate(ratesHistory, flowDate);
-        const mepRate = getMepVenta(rate) || 1;
+        const mepRate = getMepRate(rate) || 1;
         return mepRate > 0 ? amount / mepRate : amount;
     }
     if (flow.moneda === 'USD' && currency !== 'USD') {
         const rate = getRateForDate(ratesHistory, flowDate);
-        const mepRate = getMepCompra(rate) || getMepVenta(rate) || 1;
+        const mepRate = getMepRate(rate) || 1;
         return amount * mepRate;
     }
     return amount;
@@ -404,18 +412,15 @@ function getFlowAmountInCurrency(flow, currency, ratesHistory) {
 
 /**
  * Calculate complete performance metrics for a client.
- * All values converted to measurement currency using historical rates.
- *
- * @param {Array} snapshots
- * @param {Array} movements
- * @param {Object} ratesHistory - { "YYYY-MM-DD": { mepCompra, mepVenta, ... } }
- * @param {string} currency - "ARS" or "USD"
+ * Uses manualFlows (user-entered external cash flows in USD) for XIRR.
+ * manualFlows = [{ date, amount }] where amount > 0 = deposit, < 0 = withdrawal
  */
-export function calculatePerformance(snapshots, movements, ratesHistory = {}, currency = 'ARS') {
+export function calculatePerformance(snapshots, movements, ratesHistory = {}, currency = 'ARS', manualFlows = []) {
     const result = {
         totalReturn: null,
         annualizedTIR: null,
         ytdReturn: null,
+        prevYearReturn: null,
         startDate: null,
         endDate: null,
     };
@@ -429,53 +434,114 @@ export function calculatePerformance(snapshots, movements, ratesHistory = {}, cu
     result.startDate = firstSnapshot.date;
     result.endDate = lastSnapshot.date;
 
-    // 1. TIR ANUALIZADA
-    result.annualizedTIR = computeXIRRForRange(
-        firstSnapshot, lastSnapshot, movements, ratesHistory, currency
-    );
+    // XIRR between two snapshots using manual flows
+    function xirrBetween(snapA, snapB) {
+        const dA = new Date(snapA.date);
+        const dB = new Date(snapB.date);
+        const days = (dB - dA) / (1000 * 60 * 60 * 24);
+        if (days <= 0) return 0;
 
-    // === 2. TOTAL RETURN: punta a punta (compounded over the period) ===
-    // If we have the annualized TIR, compound it over the full period
+        const vA = getSnapshotValueInCurrency(snapA, currency, ratesHistory);
+        const vB = getSnapshotValueInCurrency(snapB, currency, ratesHistory);
+
+        const flowsInRange = (manualFlows || []).filter(f => f.date > snapA.date && f.date < snapB.date);
+
+        if (flowsInRange.length === 0) {
+            if (vA === 0) return 0;
+            return Math.pow(vB / vA, 365.25 / days) - 1;
+        }
+
+        // Convert flow amount to target currency using MEP rate
+        function convertFlow(flow) {
+            const flowCurrency = flow.currency || 'USD';
+            if (flowCurrency === currency) return flow.amount; // Same currency, no conversion
+
+            const rate = getMepRate(getRateForDate(ratesHistory, flow.date));
+            if (!rate || rate <= 0) return flow.amount; // No rate available, use as-is
+
+            if (flowCurrency === 'ARS' && (currency === 'USD' || currency === 'USD_CCL')) {
+                return flow.amount / rate; // ARS → USD
+            }
+            if (flowCurrency === 'USD' && currency === 'ARS') {
+                return flow.amount * rate; // USD → ARS
+            }
+            return flow.amount;
+        }
+
+        // Build cash flows: negative = invested, positive = received
+        const cashFlows = [{ amount: -vA, date: dA }];
+        for (const f of flowsInRange) {
+            const converted = convertFlow(f);
+            cashFlows.push({ amount: -converted, date: new Date(f.date) });
+        }
+        cashFlows.push({ amount: vB, date: dB });
+
+        // DEBUG: Consolidated single log to avoid Next.js forwarding dropping lines
+        const _debugFlows = flowsInRange.map(f => {
+            const converted = convertFlow(f);
+            const rateLookup = getMepRate(getRateForDate(ratesHistory, f.date));
+            return `${f.date} | amt:${f.amount} | cur:${f.currency || 'USD'} | rate:${rateLookup} | conv:${converted.toFixed(2)}`;
+        });
+        const _debugCF = cashFlows.map(cf => `${cf.date.toISOString().split('T')[0]} | ${cf.amount.toFixed(2)}`);
+
+        const xirr = calculateXIRR(cashFlows);
+        console.log(`XIRR_DEBUG | ${snapA.date}→${snapB.date} | cur:${currency} | vA:${vA.toFixed(2)} | vB:${vB.toFixed(2)} | flows:${flowsInRange.length} | [${_debugFlows.join(' // ')}] | CF:[${_debugCF.join(' // ')}] | XIRR:${xirr !== null ? (xirr * 100).toFixed(4) + '%' : 'null'}`);
+        if (xirr !== null) return xirr;
+
+        // Fallback: Modified Dietz (annualized)
+        let wf = 0, tf = 0;
+        for (const f of flowsInRange) {
+            const converted = convertFlow(f);
+            const d = (new Date(f.date) - dA) / (1000 * 60 * 60 * 24);
+            const w = 1 - (d / days);
+            wf += (-converted) * w;
+            tf += (-converted);
+        }
+        if (vA - wf === 0) return 0;
+        const dietz = (vB - vA + tf) / (vA - wf);
+        return Math.pow(1 + dietz, 365.25 / days) - 1;
+    }
+
+    // 1. TIR Anualizada (full period)
+    result.annualizedTIR = xirrBetween(firstSnapshot, lastSnapshot);
+
+    // 2. TIR Total
     if (result.annualizedTIR !== null) {
-        const startDate = new Date(firstSnapshot.date);
-        const endDate = new Date(lastSnapshot.date);
-        const totalDays = (endDate - startDate) / (1000 * 60 * 60 * 24);
-        const years = totalDays / 365.25;
-        result.totalReturn = Math.pow(1 + result.annualizedTIR, years) - 1;
+        const days = (new Date(lastSnapshot.date) - new Date(firstSnapshot.date)) / (1000 * 60 * 60 * 24);
+        result.totalReturn = Math.pow(1 + result.annualizedTIR, days / 365.25) - 1;
     }
 
-    // === 3. YTD RETURN (from closest snapshot to Jan 1 of current year to last snapshot) ===
-    const currentYear = new Date().getFullYear();
-    const jan1Str = `${currentYear}-01-01`;
+    function findOnOrBefore(dateStr) {
+        for (let i = sorted.length - 1; i >= 0; i--) { if (sorted[i].date <= dateStr) return sorted[i]; }
+        return null;
+    }
+    function findOnOrAfter(dateStr) {
+        for (let i = 0; i < sorted.length; i++) { if (sorted[i].date >= dateStr) return sorted[i]; }
+        return null;
+    }
 
-    // Find the snapshot closest to (but on or before) Jan 1
-    let ytdStart = null;
+    const yr = new Date().getFullYear();
+    const jan1 = `${yr}-01-01`;
 
-    for (let i = sorted.length - 1; i >= 0; i--) {
-        if (sorted[i].date <= jan1Str) {
-            ytdStart = sorted[i];
-            break;
+    // 3. TIR YTD
+    const ytdS = findOnOrBefore(jan1) || findOnOrAfter(jan1);
+    if (ytdS && ytdS !== lastSnapshot) {
+        const a = xirrBetween(ytdS, lastSnapshot);
+        if (a !== null) {
+            const d = (new Date(lastSnapshot.date) - new Date(ytdS.date)) / (1000 * 60 * 60 * 24);
+            result.ytdReturn = Math.pow(1 + a, d / 365.25) - 1;
         }
     }
 
-    // If no snapshot before Jan 1, use the first snapshot of the year
-    if (!ytdStart) {
-        const thisYearSnapshots = sorted.filter(s => s.date.startsWith(String(currentYear)));
-        if (thisYearSnapshots.length > 0) {
-            ytdStart = thisYearSnapshots[0];
-        }
-    }
-
-    if (ytdStart && ytdStart !== lastSnapshot) {
-        result.ytdReturn = computeXIRRForRange(ytdStart, lastSnapshot, movements, ratesHistory, currency);
-        // YTD is a short period, show total return not annualized
-        if (result.ytdReturn !== null) {
-            const ytdStartDate = new Date(ytdStart.date);
-            const ytdEndDate = new Date(lastSnapshot.date);
-            const ytdDays = (ytdEndDate - ytdStartDate) / (1000 * 60 * 60 * 24);
-            const ytdYears = ytdDays / 365.25;
-            // Convert annualized to total period return
-            result.ytdReturn = Math.pow(1 + result.ytdReturn, ytdYears) - 1;
+    // 4. TIR Año Anterior
+    const jan1Prev = `${yr - 1}-01-01`;
+    const pS = findOnOrBefore(jan1Prev) || findOnOrAfter(jan1Prev);
+    const pE = findOnOrBefore(jan1);
+    if (pS && pE && pS !== pE) {
+        const a = xirrBetween(pS, pE);
+        if (a !== null) {
+            const d = (new Date(pE.date) - new Date(pS.date)) / (1000 * 60 * 60 * 24);
+            result.prevYearReturn = Math.pow(1 + a, d / 365.25) - 1;
         }
     }
 
@@ -484,6 +550,7 @@ export function calculatePerformance(snapshots, movements, ratesHistory = {}, cu
 
 /**
  * Compute XIRR between two snapshots (currency-aware).
+ * ALWAYS returns an ANNUALIZED rate for consistency.
  */
 function computeXIRRForRange(startSnap, endSnap, movements, ratesHistory, currency) {
     const startDate = new Date(startSnap.date);
@@ -503,8 +570,12 @@ function computeXIRRForRange(startSnap, endSnap, movements, ratesHistory, curren
         .sort((a, b) => new Date(a.concertDate) - new Date(b.concertDate));
 
     if (externalFlows.length === 0) {
+        // No external flows — simple return, ANNUALIZED
         if (startValue === 0) return 0;
-        return (endValue / startValue) - 1;
+        const periodReturn = (endValue / startValue) - 1;
+        const years = totalDays / 365.25;
+        // Annualize: (1 + periodReturn)^(1/years) - 1
+        return Math.pow(1 + periodReturn, 1 / years) - 1;
     }
 
     const cashFlows = [];
@@ -521,6 +592,20 @@ function computeXIRRForRange(startSnap, endSnap, movements, ratesHistory, curren
     }
 
     cashFlows.push({ amount: endValue, date: endDate });
+
+    // DEBUG: Print all cash flows for comparison with Excel
+    console.log('=== XIRR DEBUG ===');
+    console.log(`Period: ${startSnap.date} → ${endSnap.date} | Currency: ${currency}`);
+    console.log(`Start Value: ${startValue.toFixed(2)} | End Value: ${endValue.toFixed(2)}`);
+    console.log(`External flows (${externalFlows.length}):`);
+    for (const f of externalFlows) {
+        const converted = getFlowAmountInCurrency(f, currency, ratesHistory);
+        console.log(`  ${f.concertDate} | ${f.classification} | ${f.tipoMov} | moneda: ${f.moneda} | monto: ${f.monto} | converted: ${converted.toFixed(2)}`);
+    }
+    console.log('Cash flows for XIRR:');
+    for (const cf of cashFlows) {
+        console.log(`  ${cf.date.toISOString().split('T')[0]} | ${cf.amount.toFixed(2)}`);
+    }
 
     const xirr = calculateXIRR(cashFlows);
     if (xirr !== null) return xirr;

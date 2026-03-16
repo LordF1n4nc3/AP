@@ -11,8 +11,46 @@ import {
   getTotalWithdrawals,
   formatCurrency,
   formatPercent,
+  getRateForDate,
+  getMepRate,
 } from './lib/parsers';
 import { supabase } from './lib/supabase';
+
+async function syncHistoricalMepForDates(dates, ratesHistory, dispatch) {
+  const normalizedDates = [...new Set((dates || []).filter(Boolean))].sort();
+  const missingDates = normalizedDates.filter(date => !getMepRate(getRateForDate(ratesHistory, date)));
+
+  if (missingDates.length === 0) {
+    return { syncedDates: [], skipped: true };
+  }
+
+  const desde = missingDates[0];
+  const hasta = missingDates[missingDates.length - 1];
+
+  const res = await fetch('/api/iol', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'historical_mep',
+      params: { desde, hasta },
+    }),
+  });
+
+  const json = await res.json();
+  if (!res.ok || json.error) {
+    throw new Error(json.error || 'No se pudo sincronizar el MEP histórico');
+  }
+
+  const ratesByDate = json.data?.ratesByDate || {};
+  if (Object.keys(ratesByDate).length > 0) {
+    dispatch({
+      type: 'SET_RATES_HISTORY',
+      payload: { ratesByDate },
+    });
+  }
+
+  return { syncedDates: Object.keys(ratesByDate), skipped: false };
+}
 
 function AppContent() {
   const { state, dispatch } = useApp();
@@ -66,61 +104,11 @@ function AppContent() {
 
   const clients = Object.values(state.clients);
 
-  // Auto-fetch exchange rates on mount if not fetched today
-  useEffect(() => {
-    const today = new Date().toISOString().split('T')[0];
-    const lastFetch = state.ratesLastFetch ? state.ratesLastFetch.split('T')[0] : null;
-
-    async function fetchRates() {
-      try {
-        // Fetch current rates if not fetched today
-        if (lastFetch !== today) {
-          const res = await fetch('/api/rates?type=current');
-          if (res.ok) {
-            const data = await res.json();
-            dispatch({
-              type: 'SET_RATES',
-              payload: { usd: data.mep.venta, ccl: data.ccl.venta },
-            });
-            dispatch({
-              type: 'SET_RATES_HISTORY',
-              payload: {
-                ratesByDate: {
-                  [today]: {
-                    mep: { compra: data.mep.compra, venta: data.mep.venta },
-                    ccl: { compra: data.ccl.compra, venta: data.ccl.venta },
-                  },
-                },
-              },
-            });
-          }
-        }
-
-        // Fetch historical rates if we don't have data from mid-2025
-        const historyKeys = Object.keys(state.ratesHistory || {});
-        const hasOldData = historyKeys.some(d => d <= '2025-07-01');
-        if (!hasOldData) {
-          const hRes = await fetch('/api/rates?type=historical');
-          if (hRes.ok) {
-            const hData = await hRes.json();
-            dispatch({
-              type: 'SET_RATES_HISTORY',
-              payload: { ratesByDate: hData.ratesByDate },
-            });
-          }
-        }
-      } catch (e) {
-        console.error('Auto-fetch rates failed:', e);
-      }
-    }
-    fetchRates();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Calculate aggregate stats
   const totalAUM = clients.reduce((sum, c) => {
     const latest = c.snapshots[c.snapshots.length - 1];
     if (!latest) return sum;
-    const usdCashInArs = (latest.availableDolares || 0) * (state.usdRate || 1);
+    const currentMepRate = getMepRate(getRateForDate(state.ratesHistory, latest.date)) || 1;
+    const usdCashInArs = (latest.availableDolares || 0) * currentMepRate;
     return sum + (latest.totalValue || 0) + usdCashInArs;
   }, 0);
 
@@ -252,14 +240,7 @@ function AppContent() {
             Mercado IOL
           </button>
 
-          <span className="sidebar-section-title">Configuración</span>
-          <button
-            className={`nav-item ${currentPage === 'settings' ? 'active' : ''}`}
-            onClick={() => setCurrentPage('settings')}
-          >
-            <span className="nav-icon">⚙️</span>
-            Cotizaciones
-          </button>
+
         </nav>
 
         <div style={{ padding: '16px 12px', borderTop: '1px solid var(--border-color)' }}>
@@ -271,6 +252,14 @@ function AppContent() {
             <span className="nav-icon">🚪</span>
             Cerrar Sesión
           </button>
+          <button
+            onClick={() => { if (window.confirm('¿Seguro que querés borrar TODOS los datos? Esta acción no se puede deshacer.')) { dispatch({ type: 'CLEAR_ALL_DATA' }); window.location.reload(); } }}
+            className="nav-item"
+            style={{ width: '100%', justifyContent: 'flex-start', color: 'var(--color-danger)', background: 'none', border: 'none', cursor: 'pointer', marginTop: '4px', fontSize: '12px' }}
+          >
+            <span className="nav-icon">🗑️</span>
+            Limpiar Datos
+          </button>
           <div style={{ fontSize: '11px', color: 'var(--text-muted)', textAlign: 'center', marginTop: '12px' }}>
             <div>v0.3.5 • Conectado a Vercel</div>
           </div>
@@ -280,10 +269,10 @@ function AppContent() {
       {/* Main Content */}
       <main className="main-content">
         {currentPage === 'dashboard' && (
-          <DashboardPage clients={clients} totalAUM={totalAUM} totalClients={totalClients} onNavigate={navigateToClient} currency={state.selectedCurrency} dispatch={dispatch} usdRate={state.usdRate} cclRate={state.cclRate} />
+          <DashboardPage clients={clients} totalAUM={totalAUM} totalClients={totalClients} onNavigate={navigateToClient} currency={state.selectedCurrency} dispatch={dispatch} ratesHistory={state.ratesHistory} />
         )}
         {currentPage === 'clients' && (
-          <ClientsPage clients={clients} onNavigate={navigateToClient} currency={state.selectedCurrency} dispatch={dispatch} usdRate={state.usdRate} cclRate={state.cclRate} ratesHistory={state.ratesHistory} />
+          <ClientsPage clients={clients} onNavigate={navigateToClient} currency={state.selectedCurrency} dispatch={dispatch} ratesHistory={state.ratesHistory} />
         )}
         {currentPage === 'client-detail' && selectedClient && (
           <ClientDetailPage
@@ -293,14 +282,12 @@ function AppContent() {
             onBack={() => setCurrentPage('clients')}
             currency={state.selectedCurrency}
             dispatch={dispatch}
-            usdRate={state.usdRate}
-            cclRate={state.cclRate}
             ratesHistory={state.ratesHistory}
           />
         )}
-        {currentPage === 'upload' && <UploadPage dispatch={dispatch} clients={clients} />}
+        {currentPage === 'upload' && <UploadPage dispatch={dispatch} clients={clients} ratesHistory={state.ratesHistory} />}
         {currentPage === 'mercado' && <MercadoPage />}
-        {currentPage === 'settings' && <SettingsPage state={state} dispatch={dispatch} />}
+
       </main>
 
       {/* Toasts */}
@@ -320,10 +307,15 @@ function AppContent() {
 // ===================================================
 // DASHBOARD PAGE
 // ===================================================
-function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, dispatch, usdRate, cclRate }) {
+function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, dispatch, ratesHistory }) {
   const convertValue = (val) => {
-    if (currency === 'USD' && usdRate) return val / usdRate;
-    if (currency === 'USD_CCL' && cclRate) return val / cclRate;
+    // Para AUM global, asumimos que totalAUM ya está en ARS. 
+    // Para mostrarlo en USD, tomamos el TC del día o el último disponible globalmente (acá usamos el TC más reciente guardado en ratesHistory como proxy)
+    const allDates = Object.keys(ratesHistory || {}).sort().reverse();
+    const latestGlobalRate = allDates.length > 0 ? getMepRate(ratesHistory[allDates[0]]) : null;
+
+    if (currency === 'USD' && latestGlobalRate) return val / latestGlobalRate;
+    if (currency === 'USD_CCL' && latestGlobalRate) return val / latestGlobalRate;
     return val;
   };
   const currLabel = currency === 'ARS' ? 'ARS' : currency === 'USD' ? 'USD' : 'USD CCL';
@@ -332,11 +324,23 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
   // Top clients by portfolio value
   const topClients = [...clients]
     .filter(c => c.snapshots.length > 0)
-    .map(c => ({
-      ...c,
-      latestValue: c.snapshots[c.snapshots.length - 1]?.totalValue || 0,
-      twr: calculateTWR(c.snapshots, c.movements),
-    }))
+    .map(c => {
+      const tirFlowKeys = c.tirFlowKeys || [];
+      const selectedMovFlows = (c.movements || [])
+        .filter(m => (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') && tirFlowKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`))
+        .map(m => ({
+          date: m.concertDate,
+          amount: m.classification === 'DEPOSIT' ? Math.abs(m.monto) : -Math.abs(m.monto),
+          currency: m.moneda || 'ARS',
+        }));
+      const allFlows = [...selectedMovFlows, ...(c.manualFlows || [])];
+      const perf = calculatePerformance(c.snapshots, c.movements, ratesHistory, currency === 'USD_CCL' ? 'USD' : currency, allFlows);
+      return {
+        ...c,
+        latestValue: c.snapshots[c.snapshots.length - 1]?.totalValue || 0,
+        twr: perf.totalReturn,
+      };
+    })
     .sort((a, b) => b.latestValue - a.latestValue);
 
   return (
@@ -452,13 +456,20 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
 // ===================================================
 // CLIENTS PAGE
 // ===================================================
-function ClientsPage({ clients, onNavigate, currency, dispatch, usdRate, cclRate, ratesHistory }) {
+function ClientsPage({ clients, onNavigate, currency, dispatch, ratesHistory }) {
   const [search, setSearch] = useState('');
 
-  const convertValue = (val) => {
-    if (currency === 'USD' && usdRate) return val / usdRate;
-    if (currency === 'USD_CCL' && cclRate) return val / cclRate;
-    return val;
+  const getSnapshotArsValue = (snapshot) => {
+    if (!snapshot) return 0;
+    const rate = getMepRate(getRateForDate(ratesHistory, snapshot.date)) || 1;
+    return snapshot.totalValue + (snapshot.availableDolares * rate);
+  };
+
+  const getSnapshotUsdValue = (snapshot) => {
+    if (!snapshot) return 0;
+    const rate = getMepRate(getRateForDate(ratesHistory, snapshot.date)) || 1;
+    const totalArs = snapshot.totalValue + (snapshot.availableDolares * rate);
+    return rate > 1 ? totalArs / rate : totalArs;
   };
   const currPrefix = currency === 'ARS' ? 'ARS' : 'USD';
   const currLabel = currency === 'ARS' ? 'ARS' : currency === 'USD' ? 'USD' : 'USD CCL';
@@ -499,9 +510,15 @@ function ClientsPage({ clients, onNavigate, currency, dispatch, usdRate, cclRate
         <div className="clients-grid">
           {filtered.map(c => {
             const latest = c.snapshots[c.snapshots.length - 1];
-            const perf = calculatePerformance(c.snapshots, c.movements, ratesHistory, currency === 'USD_CCL' ? 'USD' : currency);
+            const cTirKeys = c.tirFlowKeys || [];
+            const cSelectedFlows = (c.movements || [])
+              .filter(m => (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') && cTirKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`))
+              .map(m => ({ date: m.concertDate, amount: m.classification === 'DEPOSIT' ? Math.abs(m.monto) : -Math.abs(m.monto), currency: m.moneda || 'ARS' }));
+            const cAllFlows = [...cSelectedFlows, ...(c.manualFlows || [])];
+            const perf = calculatePerformance(c.snapshots, c.movements, ratesHistory, currency === 'USD_CCL' ? 'USD' : currency, cAllFlows);
             const deposits = getTotalDeposits(c.movements);
             const withdrawals = getTotalWithdrawals(c.movements);
+            const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latest?.date)) || 1;
 
             return (
               <div key={c.accountNumber} className="client-card" onClick={() => onNavigate(c.accountNumber)}>
@@ -518,7 +535,7 @@ function ClientsPage({ clients, onNavigate, currency, dispatch, usdRate, cclRate
                   <div className="client-stat">
                     <div className="client-stat-label">Cartera ({currLabel})</div>
                     <div className="client-stat-value">
-                      {formatCurrency(convertValue((latest?.totalValue || 0) + ((latest?.availableDolares || 0) * (usdRate || 1))), currPrefix)}
+                      {formatCurrency(currency === 'ARS' ? getSnapshotArsValue(latest) : getSnapshotUsdValue(latest), currPrefix)}
                     </div>
                   </div>
                   <div className="client-stat">
@@ -548,13 +565,13 @@ function ClientsPage({ clients, onNavigate, currency, dispatch, usdRate, cclRate
                   <div className="client-stat">
                     <div className="client-stat-label">Ingresos</div>
                     <div className="client-stat-value" style={{ fontSize: '13px', color: 'var(--color-success)' }}>
-                      <FlowDisplay flow={deposits} convertValue={convertValue} currPrefix={currPrefix} usdRate={usdRate} />
+                      <FlowDisplay flow={deposits} currPrefix={currPrefix} usdRate={latestUsdRate} />
                     </div>
                   </div>
                   <div className="client-stat">
                     <div className="client-stat-label">Egresos</div>
                     <div className="client-stat-value" style={{ fontSize: '13px', color: 'var(--color-danger)' }}>
-                      <FlowDisplay flow={withdrawals} convertValue={convertValue} currPrefix={currPrefix} usdRate={usdRate} />
+                      <FlowDisplay flow={withdrawals} currPrefix={currPrefix} usdRate={latestUsdRate} />
                     </div>
                   </div>
                 </div>
@@ -583,21 +600,47 @@ function ClientsPage({ clients, onNavigate, currency, dispatch, usdRate, cclRate
 // ===================================================
 // CLIENT DETAIL PAGE
 // ===================================================
-function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, usdRate, cclRate, ratesHistory }) {
+function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, ratesHistory }) {
   if (!client) return null;
 
-  const convertValue = (val) => {
-    if (currency === 'USD' && usdRate) return val / usdRate;
-    if (currency === 'USD_CCL' && cclRate) return val / cclRate;
-    return val;
+  const getSnapshotArsValue = (snapshot) => {
+    if (!snapshot) return 0;
+    const rate = getMepRate(getRateForDate(ratesHistory, snapshot.date)) || 1;
+    return snapshot.totalValue + (snapshot.availableDolares * rate);
   };
+
+  const getSnapshotUsdValue = (snapshot) => {
+    if (!snapshot) return 0;
+    const rate = getMepRate(getRateForDate(ratesHistory, snapshot.date)) || 1;
+    const totalArs = snapshot.totalValue + (snapshot.availableDolares * rate);
+    return rate > 1 ? totalArs / rate : totalArs;
+  };
+
   const currPrefix = currency === 'ARS' ? 'ARS' : 'USD';
   const currLabel = currency === 'ARS' ? 'ARS' : currency === 'USD' ? 'USD' : 'USD CCL';
 
   const latest = client.snapshots[client.snapshots.length - 1];
-  const perf = calculatePerformance(client.snapshots, client.movements, ratesHistory, currency === 'USD_CCL' ? 'USD' : currency);
+
+  // Build combined flows: selected movements + manual flows
+  const tirFlowKeys = client.tirFlowKeys || [];
+  const selectedMovFlows = (client.movements || [])
+    .filter(m => (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') && tirFlowKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`))
+    .map(m => ({
+      date: m.concertDate,
+      amount: m.classification === 'DEPOSIT' ? Math.abs(m.monto) : -Math.abs(m.monto),
+      currency: m.moneda || 'ARS',
+    }));
+  const allFlows = [...selectedMovFlows, ...(client.manualFlows || [])];
+
+  const perf = calculatePerformance(client.snapshots, client.movements, ratesHistory, currency === 'USD_CCL' ? 'USD' : currency, allFlows);
   const totalDeposits = getTotalDeposits(client.movements);
   const totalWithdrawals = getTotalWithdrawals(client.movements);
+  const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latest?.date)) || 1;
+
+  const convertValue = (val) => {
+    if (currency === 'USD' || currency === 'USD_CCL') return val / latestUsdRate;
+    return val;
+  };
 
   // Color palette for holdings
   const holdingColors = ['#6366f1', '#8b5cf6', '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#ec4899', '#14b8a6'];
@@ -688,11 +731,11 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, usd
         <div className="stat-card accent-blue">
           <div className="stat-label">Cartera ({currLabel})</div>
           <div className="stat-value" style={{ fontSize: '20px' }}>
-            {formatCurrency(convertValue((latest?.totalValue || 0) + ((latest?.availableDolares || 0) * (usdRate || 1))), currPrefix)}
+            {formatCurrency(currency === 'ARS' ? getSnapshotArsValue(latest) : getSnapshotUsdValue(latest), currPrefix)}
           </div>
         </div>
         <div className="stat-card accent-green">
-          <div className="stat-label">Rend. Total</div>
+          <div className="stat-label">TIR Total</div>
           <div className="stat-value" style={{ fontSize: '20px', color: perf.totalReturn !== null ? (perf.totalReturn >= 0 ? 'var(--color-success)' : 'var(--color-danger)') : 'inherit' }}>
             {perf.totalReturn !== null ? formatPercent(perf.totalReturn) : 'N/A'}
           </div>
@@ -707,7 +750,7 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, usd
           </div>
         </div>
         <div className="stat-card accent-purple">
-          <div className="stat-label">Rendimiento YTD</div>
+          <div className="stat-label">TIR YTD {new Date().getFullYear()}</div>
           <div className="stat-value" style={{ fontSize: '20px', color: perf.ytdReturn !== null ? (perf.ytdReturn >= 0 ? 'var(--color-success)' : 'var(--color-danger)') : 'inherit' }}>
             {perf.ytdReturn !== null ? formatPercent(perf.ytdReturn) : 'N/A'}
           </div>
@@ -715,21 +758,27 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, usd
             <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '4px' }}>Al {perf.endDate}</div>
           )}
         </div>
+        <div className="stat-card accent-purple">
+          <div className="stat-label">TIR {new Date().getFullYear() - 1}</div>
+          <div className="stat-value" style={{ fontSize: '20px', color: perf.prevYearReturn !== null ? (perf.prevYearReturn >= 0 ? 'var(--color-success)' : 'var(--color-danger)') : 'inherit' }}>
+            {perf.prevYearReturn !== null ? formatPercent(perf.prevYearReturn) : 'N/A'}
+          </div>
+        </div>
         <div className="stat-card accent-amber">
           <div className="stat-label">Total Ingresos</div>
           <div className="stat-value" style={{ fontSize: '18px', color: 'var(--color-success)' }}>
-            <FlowDisplay flow={totalDeposits} convertValue={convertValue} currPrefix={currPrefix} usdRate={usdRate} />
+            <FlowDisplay flow={totalDeposits} currPrefix={currPrefix} usdRate={latestUsdRate} />
           </div>
         </div>
         <div className="stat-card" style={{ borderLeft: '3px solid var(--color-danger)' }}>
           <div className="stat-label">Total Egresos</div>
           <div className="stat-value" style={{ fontSize: '18px', color: 'var(--color-danger)' }}>
-            <FlowDisplay flow={totalWithdrawals} convertValue={convertValue} currPrefix={currPrefix} usdRate={usdRate} />
+            <FlowDisplay flow={totalWithdrawals} currPrefix={currPrefix} usdRate={latestUsdRate} />
           </div>
         </div>
       </div>
 
-      <div className="tabs">
+      <div className="tabs" style={{ display: 'flex', gap: '8px', overflowX: 'auto', flexWrap: 'nowrap' }}>
         <button className={`tab ${tab === 'overview' ? 'active' : ''}`} onClick={() => setTab('overview')}>
           Posiciones
         </button>
@@ -738,6 +787,9 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, usd
         </button>
         <button className={`tab ${tab === 'snapshots' ? 'active' : ''}`} onClick={() => setTab('snapshots')}>
           Historial ({client.snapshots.length})
+        </button>
+        <button className={`tab ${tab === 'rates' ? 'active' : ''}`} onClick={() => setTab('rates')}>
+          Cotizaciones
         </button>
       </div>
 
@@ -887,6 +939,10 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, usd
         </div>
       )}
 
+      {tab === 'rates' && (
+        <ClientRatesTab client={client} ratesHistory={ratesHistory} dispatch={dispatch} />
+      )}
+
       {tab === 'snapshots' && (
         <div className="card">
           {client.snapshots.length > 0 ? (
@@ -899,16 +955,31 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, usd
                     <th className="text-right">Posiciones</th>
                     <th className="text-right">Disp. Pesos</th>
                     <th className="text-right">Disp. Dólares</th>
+                    <th></th>
                   </tr>
                 </thead>
                 <tbody>
                   {[...client.snapshots].reverse().map((s, i) => (
                     <tr key={`${s.date}-${i}`}>
                       <td className="text-bold">{s.date}</td>
-                      <td className="text-right text-bold">{formatCurrency(convertValue(s.totalValue), currPrefix)}</td>
+                      <td className="text-right text-bold">{formatCurrency(currency === 'ARS' ? getSnapshotArsValue(s) : getSnapshotUsdValue(s), currPrefix)}</td>
                       <td className="text-right">{s.holdings?.length || 0}</td>
                       <td className="text-right">{formatCurrency(s.availablePesos, 'ARS')}</td>
                       <td className="text-right">{formatCurrency(s.availableDolares, 'USD')}</td>
+                      <td>
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          style={{ color: 'var(--color-danger)', fontSize: '12px' }}
+                          onClick={() => {
+                            if (confirm(`¿Eliminar snapshot del ${s.date}?`)) {
+                              dispatch({ type: 'DELETE_SNAPSHOT', payload: { accountNumber: client.accountNumber, date: s.date } });
+                              dispatch({ type: 'ADD_TOAST', payload: { type: 'success', message: `Snapshot del ${s.date} eliminado` } });
+                            }
+                          }}
+                        >
+                          🗑️
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -928,9 +999,288 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, usd
 }
 
 // ===================================================
+// MOVEMENT FLOW SELECTOR — Select which movements count for TIR
+// ===================================================
+function MovementFlowSelector({ client, dispatch, manualInputs, setManualInputs }) {
+  const depositWithdrawals = (client.movements || [])
+    .filter(m => m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL')
+    .sort((a, b) => (a.concertDate || '').localeCompare(b.concertDate || ''));
+  const tirKeys = client.tirFlowKeys || [];
+  const selectedCount = depositWithdrawals.filter(m => tirKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`)).length;
+
+  return (
+    <div className="card" style={{ marginTop: '16px' }}>
+      <div className="card-header">
+        <div>
+          <div className="card-title">💸 Flujos para TIR ({selectedCount} seleccionados de {depositWithdrawals.length})</div>
+          <div className="card-subtitle">
+            Seleccioná solo los depósitos y retiros REALES (transferencias bancarias).
+            No tildes operaciones MEP internas (donde se deposita en una moneda y se retira en otra).
+          </div>
+        </div>
+      </div>
+
+      {depositWithdrawals.length > 0 ? (
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th style={{ width: '40px' }}>TIR</th>
+                <th>Fecha</th>
+                <th>Tipo</th>
+                <th>Descripción</th>
+                <th>Moneda</th>
+                <th className="text-right">Monto</th>
+              </tr>
+            </thead>
+            <tbody>
+              {depositWithdrawals.map((m, idx) => {
+                const movKey = `${m.concertDate}|${m.movNumber}|${m.monto}`;
+                const isSelected = tirKeys.includes(movKey);
+                const isDep = m.classification === 'DEPOSIT';
+                return (
+                  <tr key={`${movKey}_${idx}`}
+                    style={{ background: isSelected ? 'rgba(99,102,241,0.08)' : 'transparent', cursor: 'pointer' }}
+                    onClick={() => dispatch({ type: 'TOGGLE_TIR_FLOW', payload: { accountNumber: client.accountNumber, movKey } })}
+                  >
+                    <td onClick={(e) => e.stopPropagation()}>
+                      <input type="checkbox" checked={isSelected}
+                        onChange={() => dispatch({ type: 'TOGGLE_TIR_FLOW', payload: { accountNumber: client.accountNumber, movKey } })}
+                        style={{ cursor: 'pointer', width: '16px', height: '16px' }} />
+                    </td>
+                    <td className="text-bold">{m.concertDate}</td>
+                    <td>
+                      {isDep
+                        ? <span className="badge badge-success">Depósito</span>
+                        : <span className="badge" style={{ background: 'rgba(239,68,68,0.15)', color: '#ef4444' }}>Retiro</span>}
+                    </td>
+                    <td style={{ fontSize: '12px', maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {m.tipoMov}
+                    </td>
+                    <td><span className="badge badge-info">{m.moneda}</span></td>
+                    <td className="text-right" style={{ color: isDep ? 'var(--color-success)' : 'var(--color-danger)', fontWeight: 600 }}>
+                      {isDep ? '+' : '-'}{Math.abs(m.monto).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '13px' }}>
+          No hay depósitos ni retiros en los movimientos cargados. Cargá un archivo de movimientos primero.
+        </div>
+      )}
+
+      {/* Mini form for manual flows */}
+      <div style={{ padding: '12px 20px', borderTop: '1px solid var(--border)' }}>
+        <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '8px' }}>
+          ¿Falta algún flujo en la lista? Agregalo manualmente:
+        </div>
+        <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+          <input type="date" className="search-input" style={{ width: '140px', padding: '6px 8px', fontSize: '12px' }}
+            value={manualInputs._flowDate || ''} onChange={(e) => setManualInputs({ ...manualInputs, _flowDate: e.target.value })} />
+          <input type="text" className="search-input" style={{ width: '130px', padding: '6px 8px', fontSize: '12px' }}
+            placeholder="Monto (+dep / -ret)" value={manualInputs._flowAmount || ''} onChange={(e) => setManualInputs({ ...manualInputs, _flowAmount: e.target.value })} />
+          <select className="search-input" style={{ width: '70px', padding: '6px 8px', fontSize: '12px' }}
+            value={manualInputs._flowCurrency || 'USD'} onChange={(e) => setManualInputs({ ...manualInputs, _flowCurrency: e.target.value })}>
+            <option value="USD">USD</option>
+            <option value="ARS">ARS</option>
+          </select>
+          <button className="btn btn-secondary btn-sm" style={{ fontSize: '12px', padding: '6px 12px' }}
+            onClick={() => {
+              const dateVal = manualInputs._flowDate;
+              const rawAmt = (manualInputs._flowAmount || '').replace(/\./g, '').replace(/,/g, '.');
+              const amount = parseFloat(rawAmt);
+              const cur = manualInputs._flowCurrency || 'USD';
+              if (!dateVal || isNaN(amount) || amount === 0) {
+                dispatch({ type: 'ADD_TOAST', payload: { type: 'error', message: 'Fecha y monto válido requeridos.' } });
+                return;
+              }
+              dispatch({ type: 'ADD_MANUAL_FLOW', payload: { accountNumber: client.accountNumber, flow: { date: dateVal, amount, currency: cur, description: 'Manual' } } });
+              setManualInputs((prev) => ({ ...prev, _flowDate: '', _flowAmount: '' }));
+              dispatch({ type: 'ADD_TOAST', payload: { type: 'success', message: `Flujo manual ${amount > 0 ? '+' : ''}${amount.toFixed(2)} ${cur} agregado` } });
+            }}>
+            ➕ Agregar
+          </button>
+        </div>
+        {(client.manualFlows || []).length > 0 && (
+          <div style={{ marginTop: '8px' }}>
+            {(client.manualFlows || []).map(f => (
+              <div key={f.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', padding: '4px 0' }}>
+                <span className="text-bold">{f.date}</span>
+                <span style={{ color: f.amount > 0 ? 'var(--color-success)' : 'var(--color-danger)', fontWeight: 600 }}>
+                  {f.amount > 0 ? '+' : ''}{Math.abs(f.amount).toLocaleString('es-AR', { minimumFractionDigits: 2 })} {f.currency || 'USD'}
+                </span>
+                <button className="btn btn-ghost btn-sm" style={{ color: 'var(--color-danger)', fontSize: '10px', padding: '2px 6px' }}
+                  onClick={() => dispatch({ type: 'DELETE_MANUAL_FLOW', payload: { accountNumber: client.accountNumber, flowId: f.id } })}>
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ===================================================
+// CLIENT RATES TAB — Manual exchange rates + external flows
+// ===================================================
+function ClientRatesTab({ client, ratesHistory, dispatch }) {
+  // Dates from snapshots, selected movements, AND manual flows that need rates
+  const snapshotDates = (client.snapshots || []).map(s => s.date).filter(Boolean);
+  const flowDates = (client.manualFlows || []).map(f => f.date).filter(Boolean);
+  const tirKeys = client.tirFlowKeys || [];
+  const selectedMovDates = (client.movements || [])
+    .filter(m => (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') && tirKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`))
+    .map(m => m.concertDate).filter(Boolean);
+  const allDates = [...new Set([...snapshotDates, ...flowDates, ...selectedMovDates])];
+  const sortedDates = allDates.sort().reverse();
+
+  const [manualInputs, setManualInputs] = useState({});
+
+  // Count how many dates are missing a rate
+  const missingCount = sortedDates.filter(d => !getMepRate(getRateForDate(ratesHistory, d))).length;
+
+  const handleSaveRate = (date) => {
+    let rawVal = (manualInputs[date] || '').trim();
+    if (!rawVal) return;
+
+    // Si tiene comas y puntos (ej 1.300,50 o 1,300.50), limpiamos el de "miles"
+    if (rawVal.includes('.') && rawVal.includes(',')) {
+      if (rawVal.indexOf('.') < rawVal.indexOf(',')) {
+        // Formato 1.300,50
+        rawVal = rawVal.replace(/\./g, '').replace(/,/g, '.');
+      } else {
+        // Formato 1,300.50
+        rawVal = rawVal.replace(/,/g, '');
+      }
+    } else {
+      // Si solo tiene coma o solo tiene punto, lo tratamos como decimal
+      rawVal = rawVal.replace(/,/g, '.');
+    }
+
+    const rate = parseFloat(rawVal);
+
+    if (!isNaN(rate) && rate > 0) {
+      dispatch({
+        type: 'ADD_MANUAL_RATE',
+        payload: { date, rate }
+      });
+      setManualInputs((prev) => ({ ...prev, [date]: '' }));
+      dispatch({ type: 'ADD_TOAST', payload: { type: 'success', message: `TC del ${date} guardado: $${rate.toLocaleString('es-AR')}` } });
+    } else {
+      dispatch({ type: 'ADD_TOAST', payload: { type: 'error', message: 'Ingresá un valor válido mayor a 0.' } });
+    }
+  };
+
+  return (
+    <>
+      <div className="card">
+        <div className="card-header">
+          <div>
+            <div className="card-title">💱 Tipo de Cambio por Fecha de Tenencia</div>
+            <div className="card-subtitle">
+              Ingresá el TC del dólar MEP para cada fecha de reporte de tenencia.
+              El rendimiento se calcula usando estos valores.
+            </div>
+          </div>
+        </div>
+
+        {missingCount > 0 && (
+          <div style={{ margin: '0 20px 16px', padding: '12px 16px', background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: 'var(--radius-sm)', fontSize: '13px', color: '#f59e0b' }}>
+            ⚠️ <strong>Faltan {missingCount} cotización{missingCount > 1 ? 'es' : ''}.</strong> Ingresá el TC para que el rendimiento se calcule correctamente.
+          </div>
+        )}
+
+        {sortedDates.length === 0 ? (
+          <div className="empty-state" style={{ padding: '32px' }}>
+            <div className="empty-state-icon" style={{ fontSize: '36px' }}>📸</div>
+            <div className="empty-state-title" style={{ fontSize: '15px' }}>Sin tenencias cargadas</div>
+            <div className="empty-state-text" style={{ fontSize: '13px' }}>
+              Cargá al menos dos archivos de tenencia de distintas fechas para poder ingresar cotizaciones.
+            </div>
+          </div>
+        ) : (
+          <div className="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>Fecha Tenencia</th>
+                  <th>TC Actual</th>
+                  <th>Estado</th>
+                  <th>Ingresar TC (USD MEP)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sortedDates.map((date) => {
+                  const rateObj = getRateForDate(ratesHistory, date);
+                  const usedRate = getMepRate(rateObj);
+                  const hasRate = usedRate !== null && usedRate > 0;
+                  const isManual = ratesHistory[date]?.isManual;
+                  const isSnapshotDate = snapshotDates.includes(date);
+                  const isFlowDate = flowDates.includes(date);
+
+                  return (
+                    <tr key={date} style={{ background: !hasRate ? 'rgba(245,158,11,0.05)' : 'transparent' }}>
+                      <td className="text-bold">
+                        {date}
+                        {isSnapshotDate && <span style={{ marginLeft: '6px', fontSize: '11px', color: 'var(--text-muted)' }}>📸</span>}
+                        {isFlowDate && <span style={{ marginLeft: '4px', fontSize: '11px', color: 'var(--text-muted)' }}>💸</span>}
+                      </td>
+                      <td>
+                        {hasRate
+                          ? <span style={{ color: 'var(--color-success)' }}>$ {usedRate.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                          : <span style={{ color: '#f59e0b' }}>— Sin cargar</span>}
+                      </td>
+                      <td>
+                        {!hasRate ? (
+                          <span className="badge badge-warning">⚠️ Pendiente</span>
+                        ) : (
+                          <span className="badge badge-success">✅ Manual</span>
+                        )}
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                          <input
+                            type="text"
+                            className="search-input"
+                            style={{ width: '130px', padding: '6px 10px', fontSize: '14px', border: !hasRate ? '2px solid #f59e0b' : undefined }}
+                            placeholder={hasRate ? 'Actualizar...' : '⚠ Completar TC'}
+                            value={manualInputs[date] !== undefined ? manualInputs[date] : (hasRate ? usedRate.toString().replace('.', ',') : '')}
+                            onChange={(e) => setManualInputs({ ...manualInputs, [date]: e.target.value })}
+                            onKeyDown={(e) => { if (e.key === 'Enter') handleSaveRate(date); }}
+                          />
+                          <button
+                            className={`btn ${!hasRate ? 'btn-primary' : 'btn-secondary'} btn-sm`}
+                            onClick={() => handleSaveRate(date)}
+                          >
+                            {!hasRate ? 'Guardar' : 'Cambiar'}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* === SELECCIÓN DE FLUJOS PARA TIR === */}
+      <MovementFlowSelector client={client} dispatch={dispatch} manualInputs={manualInputs} setManualInputs={setManualInputs} />
+    </>
+  );
+}
+
+// ===================================================
 // UPLOAD PAGE
 // ===================================================
-function UploadPage({ dispatch, clients }) {
+function UploadPage({ dispatch, clients, ratesHistory }) {
   const [uploadedFiles, setUploadedFiles] = useState([]);
   const [processing, setProcessing] = useState(false);
   const [unassignedMovements, setUnassignedMovements] = useState([]);
@@ -939,6 +1289,7 @@ function UploadPage({ dispatch, clients }) {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
     setProcessing(true);
+    const datesToSync = new Set();
 
     for (const file of files) {
       try {
@@ -953,6 +1304,7 @@ function UploadPage({ dispatch, clients }) {
 
         const parsed = parseTenenciaPDF(data.text);
         if (parsed.accountNumber) {
+          if (parsed.date) datesToSync.add(parsed.date);
           dispatch({
             type: 'ADD_SNAPSHOT',
             payload: { accountNumber: parsed.accountNumber, data: parsed },
@@ -977,14 +1329,27 @@ function UploadPage({ dispatch, clients }) {
         setTimeout(() => dispatch({ type: 'REMOVE_TOAST', payload: Date.now() }), 4000);
       }
     }
+
+    if (datesToSync.size > 0) {
+      try {
+        const { syncedDates, skipped } = await syncHistoricalMepForDates([...datesToSync], ratesHistory, dispatch);
+        if (!skipped) {
+          dispatch({ type: 'ADD_TOAST', payload: { type: 'success', message: `MEP histórico actualizado para ${syncedDates.length} fecha${syncedDates.length === 1 ? '' : 's'}.` } });
+        }
+      } catch (err) {
+        dispatch({ type: 'ADD_TOAST', payload: { type: 'error', message: `No se pudieron actualizar cotizaciones IOL: ${err.message}` } });
+      }
+    }
+
     setProcessing(false);
     e.target.value = '';
-  }, [dispatch]);
+  }, [dispatch, ratesHistory]);
 
   const handleMovimientosUpload = useCallback(async (e) => {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
     setProcessing(true);
+    const datesToSync = new Set();
 
     for (const file of files) {
       try {
@@ -1000,6 +1365,11 @@ function UploadPage({ dispatch, clients }) {
         const parsed = parseMovimientosXLS(data.html);
 
         if (parsed.movements.length === 0) throw new Error('No se encontraron movimientos');
+        parsed.movements
+          .filter(m => m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL')
+          .forEach(m => {
+            if (m.concertDate) datesToSync.add(m.concertDate);
+          });
 
         // Try to auto-assign to a client
         // If there's only one client, assign automatically
@@ -1036,11 +1406,23 @@ function UploadPage({ dispatch, clients }) {
         }]);
       }
     }
+
+    if (datesToSync.size > 0) {
+      try {
+        const { syncedDates, skipped } = await syncHistoricalMepForDates([...datesToSync], ratesHistory, dispatch);
+        if (!skipped) {
+          dispatch({ type: 'ADD_TOAST', payload: { type: 'success', message: `MEP histórico actualizado para ${syncedDates.length} fecha${syncedDates.length === 1 ? '' : 's'}.` } });
+        }
+      } catch (err) {
+        dispatch({ type: 'ADD_TOAST', payload: { type: 'error', message: `No se pudieron actualizar cotizaciones IOL: ${err.message}` } });
+      }
+    }
+
     setProcessing(false);
     e.target.value = '';
-  }, [dispatch, clients]);
+  }, [dispatch, clients, ratesHistory]);
 
-  const assignMovements = (index, accountNumber) => {
+  const assignMovements = async (index, accountNumber) => {
     const batch = unassignedMovements[index];
     dispatch({
       type: 'ASSIGN_MOVEMENTS',
@@ -1048,6 +1430,22 @@ function UploadPage({ dispatch, clients }) {
     });
     setUnassignedMovements(prev => prev.filter((_, i) => i !== index));
     dispatch({ type: 'ADD_TOAST', payload: { type: 'success', message: `Movimientos asignados exitosamente` } });
+
+    const flowDates = batch.movements
+      .filter(m => m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL')
+      .map(m => m.concertDate)
+      .filter(Boolean);
+
+    if (flowDates.length > 0) {
+      try {
+        const { syncedDates, skipped } = await syncHistoricalMepForDates(flowDates, ratesHistory, dispatch);
+        if (!skipped) {
+          dispatch({ type: 'ADD_TOAST', payload: { type: 'success', message: `MEP histórico actualizado para ${syncedDates.length} fecha${syncedDates.length === 1 ? '' : 's'}.` } });
+        }
+      } catch (err) {
+        dispatch({ type: 'ADD_TOAST', payload: { type: 'error', message: `No se pudieron actualizar cotizaciones IOL: ${err.message}` } });
+      }
+    }
   };
 
   return (
@@ -1186,193 +1584,7 @@ function UploadPage({ dispatch, clients }) {
   );
 }
 
-// ===================================================
-// SETTINGS PAGE
-// ===================================================
-function SettingsPage({ state, dispatch }) {
-  const [fetching, setFetching] = useState(false);
-  const [fetchingHistory, setFetchingHistory] = useState(false);
-
-  const inputStyle = {
-    width: '100%',
-    padding: '10px 16px',
-    background: 'var(--bg-elevated)',
-    border: '1px solid var(--border-color)',
-    borderRadius: 'var(--radius-sm)',
-    color: 'var(--text-primary)',
-    fontSize: '16px',
-    fontFamily: 'Inter, sans-serif',
-    outline: 'none',
-  };
-
-  const fetchCurrentRates = async () => {
-    setFetching(true);
-    try {
-      const res = await fetch('/api/rates?type=current');
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-
-      const today = new Date().toISOString().split('T')[0];
-      dispatch({
-        type: 'SET_RATES',
-        payload: { usd: data.mep.venta, ccl: data.ccl.venta },
-      });
-      dispatch({
-        type: 'SET_RATES_HISTORY',
-        payload: {
-          ratesByDate: {
-            [today]: {
-              mep: { compra: data.mep.compra, venta: data.mep.venta },
-              ccl: { compra: data.ccl.compra, venta: data.ccl.venta },
-            },
-          },
-        },
-      });
-      dispatch({ type: 'ADD_TOAST', payload: { type: 'success', message: `Cotización actualizada: MEP $${data.mep.venta} · CCL $${data.ccl.venta}` } });
-    } catch (e) {
-      dispatch({ type: 'ADD_TOAST', payload: { type: 'error', message: `Error: ${e.message}` } });
-    }
-    setFetching(false);
-  };
-
-  const fetchHistoricalRates = async () => {
-    setFetchingHistory(true);
-    try {
-      const res = await fetch('/api/rates?type=historical');
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-
-      dispatch({
-        type: 'SET_RATES_HISTORY',
-        payload: { ratesByDate: data.ratesByDate },
-      });
-      const count = Object.keys(data.ratesByDate).length;
-      dispatch({ type: 'ADD_TOAST', payload: { type: 'success', message: `${count} días de cotizaciones históricas cargadas` } });
-    } catch (e) {
-      dispatch({ type: 'ADD_TOAST', payload: { type: 'error', message: `Error: ${e.message}` } });
-    }
-    setFetchingHistory(false);
-  };
-
-  // Get last 30 days of history for the table
-  const historyDates = Object.keys(state.ratesHistory || {})
-    .sort((a, b) => b.localeCompare(a))
-    .slice(0, 30);
-
-  const lastFetchFormatted = state.ratesLastFetch
-    ? new Date(state.ratesLastFetch).toLocaleString('es-AR')
-    : 'Nunca';
-
-  return (
-    <>
-      <div className="page-header">
-        <h1>Cotizaciones</h1>
-        <p>Tipos de cambio USD MEP y USD CCL — Fuente: DolarAPI.com (gratis, sin límite)</p>
-      </div>
-
-      <div className="details-grid">
-        {/* Current rates card */}
-        <div className="card">
-          <div className="card-header">
-            <div>
-              <div className="card-title">💱 Cotización Actual</div>
-              <div className="card-subtitle">Última actualización: {lastFetchFormatted}</div>
-            </div>
-          </div>
-
-          <div className="stats-grid" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: '20px' }}>
-            <div className="stat-card accent-blue" style={{ padding: '16px' }}>
-              <div className="stat-label">USD MEP (Bolsa)</div>
-              <div className="stat-value" style={{ fontSize: '24px' }}>
-                {state.usdRate ? `$ ${state.usdRate.toLocaleString('es-AR', { minimumFractionDigits: 2 })}` : '-'}
-              </div>
-              <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>Precio venta</div>
-            </div>
-            <div className="stat-card accent-purple" style={{ padding: '16px' }}>
-              <div className="stat-label">USD CCL</div>
-              <div className="stat-value" style={{ fontSize: '24px' }}>
-                {state.cclRate ? `$ ${state.cclRate.toLocaleString('es-AR', { minimumFractionDigits: 2 })}` : '-'}
-              </div>
-              <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>Precio venta</div>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', gap: '12px' }}>
-            <button
-              className="btn btn-primary"
-              onClick={fetchCurrentRates}
-              disabled={fetching}
-              style={{ flex: 1 }}
-            >
-              {fetching ? <><span className="spinner" style={{ width: '16px', height: '16px' }} /> Consultando...</> : '🔄 Actualizar Cotización'}
-            </button>
-            <button
-              className="btn btn-secondary"
-              onClick={fetchHistoricalRates}
-              disabled={fetchingHistory}
-              style={{ flex: 1 }}
-            >
-              {fetchingHistory ? <><span className="spinner" style={{ width: '16px', height: '16px' }} /> Descargando...</> : '📥 Descargar Historial'}
-            </button>
-          </div>
-
-          <div style={{ marginTop: '16px', padding: '12px', background: 'var(--bg-elevated)', borderRadius: 'var(--radius-sm)', fontSize: '12px', color: 'var(--text-muted)' }}>
-            <strong style={{ color: 'var(--text-secondary)' }}>ℹ️ Fuente:</strong> DolarAPI.com + ArgentinaDatos.com — APIs públicas y gratuitas.
-            La cotización se actualiza automáticamente al abrir la app cada día.
-          </div>
-        </div>
-
-        {/* History table */}
-        <div className="card">
-          <div className="card-header">
-            <div>
-              <div className="card-title">📅 Historial de Cierres</div>
-              <div className="card-subtitle">{Object.keys(state.ratesHistory || {}).length} días guardados</div>
-            </div>
-          </div>
-
-          {historyDates.length > 0 ? (
-            <div className="table-container" style={{ maxHeight: '400px', overflowY: 'auto' }}>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Fecha</th>
-                    <th className="text-right">MEP Compra</th>
-                    <th className="text-right">MEP Venta</th>
-                    <th className="text-right">CCL Compra</th>
-                    <th className="text-right">CCL Venta</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {historyDates.map(date => {
-                    const r = state.ratesHistory[date];
-                    return (
-                      <tr key={date}>
-                        <td className="text-bold" style={{ whiteSpace: 'nowrap' }}>{date}</td>
-                        <td className="text-right">{r.mep ? `$ ${r.mep.compra?.toLocaleString('es-AR', { minimumFractionDigits: 1 })}` : '-'}</td>
-                        <td className="text-right text-bold">{r.mep ? `$ ${r.mep.venta?.toLocaleString('es-AR', { minimumFractionDigits: 1 })}` : '-'}</td>
-                        <td className="text-right">{r.ccl ? `$ ${r.ccl.compra?.toLocaleString('es-AR', { minimumFractionDigits: 1 })}` : '-'}</td>
-                        <td className="text-right text-bold">{r.ccl ? `$ ${r.ccl.venta?.toLocaleString('es-AR', { minimumFractionDigits: 1 })}` : '-'}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <div className="empty-state" style={{ padding: '32px' }}>
-              <div className="empty-state-icon" style={{ fontSize: '36px' }}>📊</div>
-              <div className="empty-state-title" style={{ fontSize: '15px' }}>Sin historial</div>
-              <div className="empty-state-text" style={{ fontSize: '13px' }}>
-                Hacé click en "Descargar Historial" para cargar todos los cierres diarios disponibles.
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-    </>
-  );
-}
+// SettingsPage removed — rates are managed manually per client in the Cotizaciones tab
 
 // ===================================================
 // FLOW DISPLAY COMPONENT (shows ARS + USD deposits/withdrawals)
@@ -1424,6 +1636,60 @@ function CurrencySelector({ currency, dispatch }) {
 // ===================================================
 // MERCADO IOL PAGE
 // ===================================================
+
+/**
+ * Detect settlement currency from IOL description, moneda field, and ticker
+ * Priority: 1) Description text  2) Ticker suffix (when moneda=2)  3) moneda field
+ * Returns: 'ARS' | 'USD MEP' | 'USD Cable' | 'USD'
+ */
+function detectSettlementCurrency(descripcion, monedaCode, simbolo) {
+  const desc = (descripcion || '').toLowerCase();
+  const ticker = (simbolo || '').toUpperCase();
+  const isUSD = monedaCode === 2 || monedaCode === '2' || monedaCode === 'dolar_Estadounidense';
+
+  // LAYER 1: Check description for explicit MEP/Cable mentions (most reliable for ONs)
+  if (desc.includes('usd mep') || desc.includes('u$s mep') || desc.includes('dolar mep') || desc.includes('dlr mep')) {
+    return 'USD MEP';
+  }
+  if (desc.includes('usdc') || desc.includes('usd cable') || desc.includes('u$s cable') || desc.includes('u$s cg') || desc.includes('dlr cable')) {
+    return 'USD Cable';
+  }
+
+  // LAYER 2: If moneda = 1 (pesos), it's ALWAYS ARS regardless of ticker or description
+  if (!isUSD) {
+    return 'ARS';
+  }
+
+  // LAYER 3: moneda = 2 (USD) - use ticker suffix to differentiate MEP vs Cable
+  // This is the standard BYMA convention and is safe because we already confirmed moneda=2
+  const lastChar = ticker.slice(-1);
+  if (lastChar === 'D') return 'USD MEP';
+  if (lastChar === 'C') return 'USD Cable';
+
+  // USD but no D/C suffix - rare, keep as generic USD
+  return 'USD';
+}
+
+/** Get color for currency badge */
+function currencyBadgeStyle(currency) {
+  const base = {
+    padding: '2px 8px',
+    borderRadius: '4px',
+    fontSize: '10px',
+    fontWeight: 700,
+    letterSpacing: '0.5px',
+    display: 'inline-block',
+    whiteSpace: 'nowrap',
+  };
+  switch (currency) {
+    case 'ARS': return { ...base, background: 'rgba(59, 130, 246, 0.15)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.3)' };
+    case 'USD MEP': return { ...base, background: 'rgba(34, 197, 94, 0.15)', color: '#4ade80', border: '1px solid rgba(34, 197, 94, 0.3)' };
+    case 'USD Cable': return { ...base, background: 'rgba(168, 85, 247, 0.15)', color: '#c084fc', border: '1px solid rgba(168, 85, 247, 0.3)' };
+    case 'USD': return { ...base, background: 'rgba(234, 179, 8, 0.15)', color: '#facc15', border: '1px solid rgba(234, 179, 8, 0.3)' };
+    default: return { ...base, background: 'rgba(100,100,100,0.15)', color: '#999' };
+  }
+}
+
 function MercadoPage() {
   const [activeTab, setActiveTab] = useState('bonos');
   const [loading, setLoading] = useState(false);
@@ -1431,6 +1697,7 @@ function MercadoPage() {
   const [requestCount, setRequestCount] = useState(0);
   const [lastUpdate, setLastUpdate] = useState(null);
   const [search, setSearch] = useState('');
+  const [currencyFilter, setCurrencyFilter] = useState('Todos');
   const [sortField, setSortField] = useState('simbolo');
   const [sortDir, setSortDir] = useState('asc');
 
@@ -1448,6 +1715,9 @@ function MercadoPage() {
     ons: { label: 'ONs', action: 'panel_obligaciones', data: ons, setData: setOns },
     cedears: { label: 'CEDEARs', action: 'panel_cedears', data: cedears, setData: setCedears },
   };
+
+  // Tabs that show currency filter (not relevant for acciones/cedears)
+  const showCurrencyFilter = ['bonos', 'letras', 'ons'].includes(activeTab);
 
   // Load persistent request count on mount (does NOT call IOL API)
   useEffect(() => {
@@ -1488,8 +1758,20 @@ function MercadoPage() {
 
   const currentData = tabConfig[activeTab]?.data || [];
 
+  // Enrich data with settlement currency
+  const enrichedData = currentData.map(item => ({
+    ...item,
+    _currency: detectSettlementCurrency(item.descripcion || item.description, item.moneda),
+  }));
+
+  // Currency filter
+  const currencyFiltered = enrichedData.filter(item => {
+    if (currencyFilter === 'Todos') return true;
+    return item._currency === currencyFilter;
+  });
+
   // Search filter
-  const filtered = currentData.filter(item => {
+  const filtered = currencyFiltered.filter(item => {
     if (!search) return true;
     const q = search.toLowerCase();
     const sym = (item.simbolo || item.symbol || '').toLowerCase();
@@ -1499,8 +1781,9 @@ function MercadoPage() {
 
   // Sort
   const sorted = [...filtered].sort((a, b) => {
-    const aVal = a[sortField] ?? '';
-    const bVal = b[sortField] ?? '';
+    const field = sortField === '_currency' ? '_currency' : sortField;
+    const aVal = a[field] ?? '';
+    const bVal = b[field] ?? '';
     if (typeof aVal === 'number' && typeof bVal === 'number') {
       return sortDir === 'asc' ? aVal - bVal : bVal - aVal;
     }
@@ -1534,6 +1817,12 @@ function MercadoPage() {
       </span>
     );
   };
+
+  // Count per currency for the badge
+  const currencyCounts = enrichedData.reduce((acc, item) => {
+    acc[item._currency] = (acc[item._currency] || 0) + 1;
+    return acc;
+  }, {});
 
   const requestPct = ((requestCount / 20000) * 100).toFixed(1);
 
@@ -1617,7 +1906,7 @@ function MercadoPage() {
           <button
             key={key}
             className={`tab ${activeTab === key ? 'active' : ''}`}
-            onClick={() => { setActiveTab(key); setSearch(''); }}
+            onClick={() => { setActiveTab(key); setSearch(''); setCurrencyFilter('Todos'); }}
           >
             {tabConfig[key].label}
             {tabConfig[key].data.length > 0 && (
@@ -1629,16 +1918,44 @@ function MercadoPage() {
         ))}
       </div>
 
-      {/* Search */}
-      <div style={{ marginBottom: '16px' }}>
+      {/* Filters row */}
+      <div style={{ display: 'flex', gap: '12px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
         <input
           type="text"
           placeholder="🔍 Buscar por ticker o descripción..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           className="search-input"
-          style={{ maxWidth: '400px' }}
+          style={{ maxWidth: '350px', flex: 1 }}
         />
+        {showCurrencyFilter && enrichedData.length > 0 && (
+          <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+            <span style={{ fontSize: '12px', color: 'var(--text-muted)', marginRight: '4px' }}>Moneda:</span>
+            {['Todos', 'ARS', 'USD MEP', 'USD Cable', 'USD'].map(opt => {
+              const count = opt === 'Todos' ? enrichedData.length : (currencyCounts[opt] || 0);
+              if (opt !== 'Todos' && count === 0) return null;
+              return (
+                <button
+                  key={opt}
+                  onClick={() => setCurrencyFilter(opt)}
+                  style={{
+                    padding: '4px 12px',
+                    borderRadius: '6px',
+                    border: currencyFilter === opt ? '1px solid var(--color-primary)' : '1px solid var(--border-color)',
+                    background: currencyFilter === opt ? 'rgba(124, 58, 237, 0.15)' : 'var(--bg-card)',
+                    color: currencyFilter === opt ? 'var(--color-primary)' : 'var(--text-secondary)',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                    fontWeight: currencyFilter === opt ? 600 : 400,
+                    transition: 'all 0.2s ease',
+                  }}
+                >
+                  {opt} <span style={{ opacity: 0.5, fontSize: '10px' }}>({count})</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Table */}
@@ -1652,7 +1969,7 @@ function MercadoPage() {
             <div className="empty-state-text">
               {currentData.length === 0
                 ? 'Apretá el botón "🔄 Actualizar" para traer los datos del mercado.'
-                : `No se encontraron títulos para "${search}"`
+                : `No se encontraron títulos para los filtros seleccionados`
               }
             </div>
           </div>
@@ -1667,6 +1984,11 @@ function MercadoPage() {
                   <th style={{ cursor: 'pointer' }} onClick={() => handleSort('descripcion')}>
                     Descripción{sortIcon('descripcion')}
                   </th>
+                  {showCurrencyFilter && (
+                    <th style={{ cursor: 'pointer', textAlign: 'center' }} onClick={() => handleSort('_currency')}>
+                      Moneda{sortIcon('_currency')}
+                    </th>
+                  )}
                   <th className="text-right" style={{ cursor: 'pointer' }} onClick={() => handleSort('ultimoPrecio')}>
                     Último{sortIcon('ultimoPrecio')}
                   </th>
@@ -1696,6 +2018,11 @@ function MercadoPage() {
                     <td style={{ fontSize: '12px', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {item.descripcion || item.description || '-'}
                     </td>
+                    {showCurrencyFilter && (
+                      <td style={{ textAlign: 'center' }}>
+                        <span style={currencyBadgeStyle(item._currency)}>{item._currency}</span>
+                      </td>
+                    )}
                     <td className="text-right text-bold">{fmtNum(item.ultimoPrecio)}</td>
                     <td className="text-right">{fmtPct(item.variacionPorcentual)}</td>
                     <td className="text-right">{fmtNum(item.apertura)}</td>

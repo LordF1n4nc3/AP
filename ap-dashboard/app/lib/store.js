@@ -86,18 +86,111 @@ function reducer(state, action) {
             };
         }
 
+        case 'DELETE_SNAPSHOT': {
+            const { accountNumber, date } = action.payload;
+            const client = state.clients[accountNumber];
+            if (!client) return state;
+            return {
+                ...state,
+                clients: {
+                    ...state.clients,
+                    [accountNumber]: {
+                        ...client,
+                        snapshots: client.snapshots.filter(s => s.date !== date),
+                    },
+                },
+            };
+        }
+
         case 'SET_CURRENCY':
             return { ...state, selectedCurrency: action.payload };
+
+        case 'ADD_MANUAL_FLOW': {
+            const { accountNumber, flow } = action.payload; // flow = { date, amount, description }
+            const cl = state.clients[accountNumber];
+            if (!cl) return state;
+            const existing = cl.manualFlows || [];
+            return {
+                ...state,
+                clients: {
+                    ...state.clients,
+                    [accountNumber]: {
+                        ...cl,
+                        manualFlows: [...existing, { ...flow, id: Date.now() }]
+                            .sort((a, b) => a.date.localeCompare(b.date)),
+                    },
+                },
+            };
+        }
+
+        case 'DELETE_MANUAL_FLOW': {
+            const { accountNumber, flowId } = action.payload;
+            const cl2 = state.clients[accountNumber];
+            if (!cl2) return state;
+            return {
+                ...state,
+                clients: {
+                    ...state.clients,
+                    [accountNumber]: {
+                        ...cl2,
+                        manualFlows: (cl2.manualFlows || []).filter(f => f.id !== flowId),
+                    },
+                },
+            };
+        }
+
+        case 'TOGGLE_TIR_FLOW': {
+            const { accountNumber, movKey } = action.payload;
+            const cl3 = state.clients[accountNumber];
+            if (!cl3) return state;
+            const current = cl3.tirFlowKeys || [];
+            const exists = current.includes(movKey);
+            return {
+                ...state,
+                clients: {
+                    ...state.clients,
+                    [accountNumber]: {
+                        ...cl3,
+                        tirFlowKeys: exists
+                            ? current.filter(k => k !== movKey)
+                            : [...current, movKey],
+                    },
+                },
+            };
+        }
 
         case 'SET_RATES':
             return { ...state, usdRate: action.payload.usd, cclRate: action.payload.ccl };
 
         case 'SET_RATES_HISTORY': {
-            const merged = { ...state.ratesHistory, ...action.payload.ratesByDate };
+            const incomingRates = action.payload.ratesByDate || {};
+            const merged = { ...state.ratesHistory };
+            for (const [date, rateData] of Object.entries(incomingRates)) {
+                if (merged[date]?.isManual) continue;
+                merged[date] = rateData;
+            }
             return {
                 ...state,
                 ratesHistory: merged,
                 ratesLastFetch: new Date().toISOString(),
+            };
+        }
+
+        case 'ADD_MANUAL_RATE': {
+            const { date, rate } = action.payload;
+            const existingMatch = state.ratesHistory[date] || {};
+            // Setting custom rate to both compra and venta so the midpoint calculation results in the exact same value.
+            return {
+                ...state,
+                ratesHistory: {
+                    ...state.ratesHistory,
+                    [date]: {
+                        ...existingMatch,
+                        mep: { compra: rate, venta: rate },
+                        ccl: { compra: rate, venta: rate },
+                        isManual: true
+                    }
+                }
             };
         }
 
@@ -107,11 +200,20 @@ function reducer(state, action) {
         case 'REMOVE_TOAST':
             return { ...state, toasts: state.toasts.filter(t => t.id !== action.payload) };
 
-        case 'LOAD_STATE':
-            return { ...state, ...action.payload, toasts: [] };
+        case 'LOAD_STATE': {
+            const loadedState = { ...state, ...action.payload, toasts: [] };
+            return loadedState;
+        }
 
         case 'MARK_DB_LOADED':
             return { ...state, dbLoaded: true };
+
+        case 'CLEAR_ALL_DATA': {
+            if (typeof window !== 'undefined') {
+                localStorage.removeItem(STORAGE_KEY);
+            }
+            return { ...initialState };
+        }
 
         default:
             return state;
