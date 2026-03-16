@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { AppProvider, useApp } from './lib/store';
 import {
   parseTenenciaPDF,
@@ -52,6 +52,106 @@ async function syncHistoricalMepForDates(dates, ratesHistory, dispatch) {
   return { syncedDates: Object.keys(ratesByDate), skipped: false };
 }
 
+async function loadCloudStateForSession(session, isAdmin) {
+  if (!session?.user?.email) {
+    return { clients: {} };
+  }
+
+  if (isAdmin) {
+    const [{ data: clientRows, error: clientsError }, { data: financialRows, error: financialError }] = await Promise.all([
+      supabase.from('clientes').select('cuenta, nombre, email_asignado'),
+      supabase.from('datos_financieros').select('cuenta, datos_json'),
+    ]);
+
+    if (clientsError) throw clientsError;
+    if (financialError) throw financialError;
+
+    const clientMetaByAccount = Object.fromEntries((clientRows || []).map(row => [row.cuenta, row]));
+    const clients = {};
+
+    for (const row of financialRows || []) {
+      const accountNumber = row.cuenta;
+      const meta = clientMetaByAccount[accountNumber] || {};
+      const clientData = row.datos_json || {};
+      clients[accountNumber] = {
+        snapshots: [],
+        movements: [],
+        ...clientData,
+        accountNumber,
+        name: clientData.name || meta.nombre || accountNumber,
+        assignedEmail: clientData.assignedEmail || meta.email_asignado || null,
+      };
+    }
+
+    return { clients };
+  }
+
+  const { data: clientRows, error: clientsError } = await supabase
+    .from('clientes')
+    .select('cuenta, nombre, email_asignado')
+    .eq('email_asignado', session.user.email.toLowerCase());
+
+  if (clientsError) throw clientsError;
+
+  const accounts = (clientRows || []).map(row => row.cuenta).filter(Boolean);
+  if (accounts.length === 0) {
+    return { clients: {} };
+  }
+
+  const { data: financialRows, error: financialError } = await supabase
+    .from('datos_financieros')
+    .select('cuenta, datos_json')
+    .in('cuenta', accounts);
+
+  if (financialError) throw financialError;
+
+  const metaByAccount = Object.fromEntries((clientRows || []).map(row => [row.cuenta, row]));
+  const clients = {};
+
+  for (const row of financialRows || []) {
+    const accountNumber = row.cuenta;
+    const meta = metaByAccount[accountNumber] || {};
+    const clientData = row.datos_json || {};
+    clients[accountNumber] = {
+      snapshots: [],
+      movements: [],
+      ...clientData,
+      accountNumber,
+      name: clientData.name || meta.nombre || accountNumber,
+      assignedEmail: clientData.assignedEmail || meta.email_asignado || session.user.email.toLowerCase(),
+    };
+  }
+
+  return { clients };
+}
+
+async function upsertClientToCloud(client, assignedEmailOverride) {
+  const rawAssignedEmail = assignedEmailOverride ?? client.assignedEmail ?? '';
+  const assignedEmail = rawAssignedEmail.trim().toLowerCase() || null;
+
+  const { error: clientError } = await supabase
+    .from('clientes')
+    .upsert({
+      cuenta: client.accountNumber,
+      nombre: client.name,
+      email_asignado: assignedEmail,
+    }, { onConflict: 'cuenta' });
+
+  if (clientError) throw clientError;
+
+  const { error: dataError } = await supabase
+    .from('datos_financieros')
+    .upsert({
+      cuenta: client.accountNumber,
+      datos_json: {
+        ...client,
+        assignedEmail,
+      },
+    }, { onConflict: 'cuenta' });
+
+  if (dataError) throw dataError;
+}
+
 function AppContent() {
   const { state, dispatch } = useApp();
   const [currentPage, setCurrentPage] = useState('dashboard');
@@ -65,6 +165,10 @@ function AppContent() {
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState('');
   const [isSignUp, setIsSignUp] = useState(false);
+  const [cloudLoading, setCloudLoading] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState('');
+  const [bulkCloudSaving, setBulkCloudSaving] = useState(false);
+  const previousSessionEmailRef = useRef(null);
 
   // Subscribe to Auth status
   useEffect(() => {
@@ -104,6 +208,56 @@ function AppContent() {
 
   const clients = Object.values(state.clients);
 
+  useEffect(() => {
+    const currentEmail = session?.user?.email?.toLowerCase() || null;
+    if (previousSessionEmailRef.current !== currentEmail) {
+      previousSessionEmailRef.current = currentEmail;
+      setCloudStatus('');
+      dispatch({ type: 'RESET_DB_LOADED' });
+    }
+  }, [session?.user?.email, dispatch]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function hydrateFromCloud() {
+      if (!session || state.dbLoaded) return;
+
+      setCloudLoading(true);
+      setCloudStatus('');
+      try {
+        const { clients: cloudClients } = await loadCloudStateForSession(session, isAdmin);
+        if (cancelled) return;
+
+        const hasCloudClients = Object.keys(cloudClients || {}).length > 0;
+
+        if (hasCloudClients) {
+          dispatch({ type: 'LOAD_STATE', payload: { clients: cloudClients } });
+          setCloudStatus('Datos cargados desde Supabase.');
+        } else {
+          setCloudStatus('No hay clientes guardados en Supabase.');
+        }
+      } catch (err) {
+        if (!cancelled) {
+          console.error('Cloud load failed:', err);
+          const message = `No se pudo cargar la nube${err?.message ? `: ${err.message}` : ''}. Se usan los datos locales.`;
+          setCloudStatus(message);
+          dispatch({ type: 'ADD_TOAST', payload: { type: 'error', message } });
+        }
+      } finally {
+        if (!cancelled) {
+          dispatch({ type: 'MARK_DB_LOADED' });
+          setCloudLoading(false);
+        }
+      }
+    }
+
+    hydrateFromCloud();
+    return () => {
+      cancelled = true;
+    };
+  }, [session, isAdmin, state.dbLoaded, dispatch]);
+
   const totalAUM = clients.reduce((sum, c) => {
     const latest = c.snapshots[c.snapshots.length - 1];
     if (!latest) return sum;
@@ -118,6 +272,31 @@ function AppContent() {
     setSelectedClient(accountNumber);
     setCurrentPage('client-detail');
     setClientTab('overview');
+  };
+
+  const handleBulkCloudSync = async () => {
+    const clientsToSync = Object.values(state.clients).filter(client => client?.accountNumber);
+    if (clientsToSync.length === 0) {
+      dispatch({ type: 'ADD_TOAST', payload: { type: 'info', message: 'No hay clientes locales para sincronizar.' } });
+      return;
+    }
+
+    setBulkCloudSaving(true);
+    try {
+      for (const client of clientsToSync) {
+        await upsertClientToCloud(client);
+      }
+      const message = `Se sincronizaron ${clientsToSync.length} clientes a Supabase.`;
+      setCloudStatus(message);
+      dispatch({ type: 'ADD_TOAST', payload: { type: 'success', message } });
+    } catch (err) {
+      console.error('Bulk cloud sync failed:', err);
+      const message = `No se pudo sincronizar a Supabase${err?.message ? `: ${err.message}` : '.'}`;
+      setCloudStatus(message);
+      dispatch({ type: 'ADD_TOAST', payload: { type: 'error', message } });
+    } finally {
+      setBulkCloudSaving(false);
+    }
   };
 
   if (!session) {
@@ -202,6 +381,8 @@ function AppContent() {
               <span className="sidebar-logo-title">RC Partners</span>
               <span className="sidebar-logo-subtitle">Dashboard AP</span>
             </div>
+            {cloudLoading && <div>Cargando Supabase...</div>}
+            {!cloudLoading && !!cloudStatus && <div style={{ color: cloudStatus.includes('No se pudo') ? 'var(--text-negative)' : 'var(--text-muted)' }}>{cloudStatus}</div>}
           </div>
         </div>
 
@@ -260,6 +441,17 @@ function AppContent() {
             <span className="nav-icon">🗑️</span>
             Limpiar Datos
           </button>
+          {isAdmin && (
+            <button
+              onClick={handleBulkCloudSync}
+              className="nav-item"
+              disabled={bulkCloudSaving}
+              style={{ width: '100%', justifyContent: 'flex-start', color: 'var(--color-primary)', background: 'none', border: 'none', cursor: 'pointer', marginTop: '4px', fontSize: '12px', opacity: bulkCloudSaving ? 0.7 : 1 }}
+            >
+              <span className="nav-icon">â˜ï¸</span>
+              {bulkCloudSaving ? 'Subiendo a Supabase...' : 'Subir clientes locales'}
+            </button>
+          )}
           <div style={{ fontSize: '11px', color: 'var(--text-muted)', textAlign: 'center', marginTop: '12px' }}>
             <div>v0.3.5 • Conectado a Vercel</div>
           </div>
@@ -651,26 +843,7 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, rat
   const saveToCloud = async () => {
     setSavingLoading(true);
     try {
-      // 1. Update/Upsert in 'clientes' table
-      const { error: clientError } = await supabase
-        .from('clientes')
-        .upsert({
-          cuenta: client.accountNumber,
-          nombre: client.name,
-          email_asignado: assignedEmail || null
-        }, { onConflict: 'cuenta' });
-
-      if (clientError) throw clientError;
-
-      // 2. Update/Upsert in 'datos_financieros' table
-      const { error: dataError } = await supabase
-        .from('datos_financieros')
-        .upsert({
-          cuenta: client.accountNumber,
-          datos_json: client
-        }, { onConflict: 'cuenta' });
-
-      if (dataError) throw dataError;
+      await upsertClientToCloud(client, assignedEmail);
 
       dispatch({ type: 'ADD_TOAST', payload: { type: 'success', title: '¡Guardado!', message: 'Datos respaldados en la nube.' } });
     } catch (err) {

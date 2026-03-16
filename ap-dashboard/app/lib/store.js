@@ -208,6 +208,9 @@ function reducer(state, action) {
         case 'MARK_DB_LOADED':
             return { ...state, dbLoaded: true };
 
+        case 'RESET_DB_LOADED':
+            return { ...state, dbLoaded: false };
+
         case 'CLEAR_ALL_DATA': {
             if (typeof window !== 'undefined') {
                 localStorage.removeItem(STORAGE_KEY);
