@@ -689,17 +689,23 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
   };
   const currLabel = currency === 'ARS' ? 'ARS' : currency === 'USD' ? 'USD' : 'USD CCL';
   const currPrefix = currency === 'ARS' ? 'ARS' : 'USD';
+  const currentYear = new Date().getFullYear();
+  const previousYear = currentYear - 1;
 
   // Top clients by portfolio value
   const topClients = [...clients]
     .filter(c => c.snapshots.length > 0)
     .map(c => {
+      const latestSnapshot = c.snapshots[c.snapshots.length - 1];
       const allFlows = getSelectedExternalFlows(c);
       const perf = calculatePerformance(c.snapshots, c.movements, ratesHistory, currency === 'USD_CCL' ? 'USD' : currency, allFlows);
+      const portfolioValue = getSnapshotValueInDisplayCurrency(latestSnapshot, currency, ratesHistory);
       return {
         ...c,
-        latestValue: c.snapshots[c.snapshots.length - 1]?.totalValue || 0,
-        twr: perf.totalReturn,
+        latestValue: portfolioValue,
+        totalReturn: perf.totalReturn,
+        ytdReturn: perf.ytdReturn,
+        prevYearReturn: perf.prevYearReturn,
         nominalGain: getNominalGainValue(c, currency, ratesHistory),
       };
     })
@@ -771,7 +777,9 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
                   <th>Cuenta</th>
                   <th className="text-right">Cartera ({currLabel})</th>
                   <th className="text-right">Ganancia Neta</th>
-                  <th className="text-right">Rendimiento</th>
+                  <th className="text-right">TIR Total</th>
+                  <th className="text-right">TIR YTD {currentYear}</th>
+                  <th className="text-right">TIR {previousYear}</th>
                   <th className="text-right">Posiciones</th>
                   <th></th>
                 </tr>
@@ -782,13 +790,23 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
                     <td className="text-bold">{c.name}</td>
                     <td style={{ fontFamily: 'monospace', fontSize: '13px' }}>{c.accountNumber}</td>
                     <td className="text-right text-bold">
-                      {formatCurrency(convertValue(c.latestValue), currPrefix)}
+                      {formatCurrency(c.latestValue, currPrefix)}
                     </td>
                     <td className={`text-right ${c.nominalGain >= 0 ? 'text-positive' : 'text-negative'}`}>
                       {formatCurrency(c.nominalGain, currPrefix)}
                     </td>
-                    <td className={`text-right ${c.twr !== null ? (c.twr >= 0 ? 'text-positive' : 'text-negative') : ''}`}>
-                      {c.twr !== null ? formatPercent(c.twr) : (
+                    <td className={`text-right ${c.totalReturn !== null ? (c.totalReturn >= 0 ? 'text-positive' : 'text-negative') : ''}`}>
+                      {c.totalReturn !== null ? formatPercent(c.totalReturn) : (
+                        <span className="badge badge-neutral">Sin datos</span>
+                      )}
+                    </td>
+                    <td className={`text-right ${c.ytdReturn !== null ? (c.ytdReturn >= 0 ? 'text-positive' : 'text-negative') : ''}`}>
+                      {c.ytdReturn !== null ? formatPercent(c.ytdReturn) : (
+                        <span className="badge badge-neutral">Sin datos</span>
+                      )}
+                    </td>
+                    <td className={`text-right ${c.prevYearReturn !== null ? (c.prevYearReturn >= 0 ? 'text-positive' : 'text-negative') : ''}`}>
+                      {c.prevYearReturn !== null ? formatPercent(c.prevYearReturn) : (
                         <span className="badge badge-neutral">Sin datos</span>
                       )}
                     </td>
