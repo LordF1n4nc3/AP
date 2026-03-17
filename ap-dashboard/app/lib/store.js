@@ -140,11 +140,12 @@ function reducer(state, action) {
         }
 
         case 'TOGGLE_TIR_FLOW': {
-            const { accountNumber, movKey } = action.payload;
+            const { accountNumber, movKey, aliases = [] } = action.payload;
             const cl3 = state.clients[accountNumber];
             if (!cl3) return state;
             const current = cl3.tirFlowKeys || [];
-            const exists = current.includes(movKey);
+            const equivalentKeys = new Set([movKey, ...aliases]);
+            const exists = current.some(key => equivalentKeys.has(key));
             return {
                 ...state,
                 clients: {
@@ -152,8 +153,8 @@ function reducer(state, action) {
                     [accountNumber]: {
                         ...cl3,
                         tirFlowKeys: exists
-                            ? current.filter(k => k !== movKey)
-                            : [...current, movKey],
+                            ? current.filter(k => !equivalentKeys.has(k))
+                            : [...current.filter(k => !equivalentKeys.has(k)), movKey],
                     },
                 },
             };

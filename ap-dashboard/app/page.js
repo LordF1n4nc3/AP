@@ -196,16 +196,76 @@ async function upsertClientToCloud(client, assignedEmailOverride) {
   if (dataError) throw dataError;
 }
 
-function getFlowTotalInCurrency(flow, currency, usdRate) {
+function getLegacyMovementFlowKey(movement) {
+  if (!movement) return null;
+  return `${movement.concertDate || ''}|${movement.movNumber || ''}|${movement.monto || ''}`;
+}
+
+function getMovementFlowKey(movement) {
+  if (!movement) return null;
+  if (movement.movNumber !== undefined && movement.movNumber !== null && movement.movNumber !== '') {
+    return `mov:${movement.movNumber}`;
+  }
+  return getLegacyMovementFlowKey(movement);
+}
+
+function getMovementFlowKeyAliases(movement) {
+  const aliases = [getMovementFlowKey(movement), getLegacyMovementFlowKey(movement)].filter(Boolean);
+  return [...new Set(aliases)];
+}
+
+function isMovementSelected(movement, tirFlowKeys = []) {
+  const selectedKeys = new Set(tirFlowKeys || []);
+  return getMovementFlowKeyAliases(movement).some(key => selectedKeys.has(key));
+}
+
+function getSelectedExternalMovements(client) {
+  const tirFlowKeys = client?.tirFlowKeys || [];
+  return (client?.movements || []).filter(m =>
+    (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') &&
+    isMovementSelected(m, tirFlowKeys)
+  );
+}
+
+function getSelectedExternalFlows(client) {
+  const movementFlows = getSelectedExternalMovements(client).map(m => ({
+    date: m.concertDate,
+    amount: m.classification === 'DEPOSIT' ? Math.abs(Number(m.monto) || 0) : -Math.abs(Number(m.monto) || 0),
+    currency: m.moneda || 'ARS',
+  }));
+
+  const manualFlows = (client?.manualFlows || [])
+    .filter(flow => flow?.date)
+    .map(flow => ({
+      ...flow,
+      amount: Number(flow.amount) || 0,
+      currency: flow.currency || 'USD',
+    }));
+
+  return [...movementFlows, ...manualFlows];
+}
+
+function getFlowAmountInDisplayCurrency(flow, currency, ratesHistory) {
   if (!flow) return 0;
 
-  if (currency === 'USD' || currency === 'USD_CCL') {
-    const arsInUsd = usdRate > 0 ? (flow.ars || 0) / usdRate : 0;
-    return arsInUsd + (flow.usd || 0);
+  const displayCurrency = currency === 'USD_CCL' ? 'USD' : currency;
+  const flowCurrency = flow.currency || 'ARS';
+  const isUsdLikeFlow = flowCurrency !== 'ARS';
+  const amount = Number(flow.amount) || 0;
+  const flowRate = getMepRate(getRateForDate(ratesHistory, flow.date)) || 1;
+
+  if (displayCurrency === 'USD') {
+    if (!isUsdLikeFlow) {
+      return flowRate > 0 ? amount / flowRate : 0;
+    }
+    return amount;
   }
 
-  const usdInArs = (flow.usd || 0) * (usdRate || 1);
-  return (flow.ars || 0) + usdInArs;
+  if (isUsdLikeFlow) {
+    return amount * flowRate;
+  }
+
+  return amount;
 }
 
 function getSnapshotValueInDisplayCurrency(snapshot, currency, ratesHistory) {
@@ -221,20 +281,26 @@ function getSnapshotValueInDisplayCurrency(snapshot, currency, ratesHistory) {
   return totalArs;
 }
 
-function getMovementTotalsInRange(movements, startDate, endDate) {
-  const relevantMovements = (movements || []).filter(m => {
-    if (!m?.concertDate) return false;
-    if (m.classification !== 'DEPOSIT' && m.classification !== 'WITHDRAWAL') return false;
-    return m.concertDate >= startDate && m.concertDate <= endDate;
-  });
+function getFlowTotalsInRange(flows, startDate, endDate, currency, ratesHistory) {
+  return (flows || []).reduce((acc, flow) => {
+    if (!flow?.date || flow.date < startDate || flow.date > endDate) {
+      return acc;
+    }
 
-  return {
-    deposits: getTotalDeposits(relevantMovements),
-    withdrawals: getTotalWithdrawals(relevantMovements),
-  };
+    const convertedAmount = getFlowAmountInDisplayCurrency(flow, currency, ratesHistory);
+
+    if (convertedAmount >= 0) {
+      acc.deposits += convertedAmount;
+    } else {
+      acc.withdrawals += Math.abs(convertedAmount);
+    }
+
+    return acc;
+  }, { deposits: 0, withdrawals: 0 });
 }
 
-function getNominalGainValue(snapshots, movements, currency, ratesHistory) {
+function getNominalGainValue(client, currency, ratesHistory) {
+  const snapshots = client?.snapshots || [];
   if (!snapshots || snapshots.length === 0) return 0;
 
   const sortedSnapshots = [...snapshots].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
@@ -242,13 +308,17 @@ function getNominalGainValue(snapshots, movements, currency, ratesHistory) {
   const lastSnapshot = sortedSnapshots[sortedSnapshots.length - 1];
   const firstSnapshotValue = getSnapshotValueInDisplayCurrency(firstSnapshot, currency, ratesHistory);
   const lastSnapshotValue = getSnapshotValueInDisplayCurrency(lastSnapshot, currency, ratesHistory);
-  const lastUsdRate = getMepRate(getRateForDate(ratesHistory, lastSnapshot?.date)) || 1;
-  const { deposits, withdrawals } = getMovementTotalsInRange(movements, firstSnapshot.date, lastSnapshot.date);
-  const depositsInCurrency = getFlowTotalInCurrency(deposits, currency, lastUsdRate);
-  const withdrawalsInCurrency = getFlowTotalInCurrency(withdrawals, currency, lastUsdRate);
+  const externalFlows = getSelectedExternalFlows(client);
+  const { deposits, withdrawals } = getFlowTotalsInRange(
+    externalFlows,
+    firstSnapshot.date,
+    lastSnapshot.date,
+    currency,
+    ratesHistory
+  );
 
   // Resultado nominal = tenencia final + egresos - ingresos - tenencia inicial
-  return lastSnapshotValue + withdrawalsInCurrency - depositsInCurrency - firstSnapshotValue;
+  return lastSnapshotValue + withdrawals - deposits - firstSnapshotValue;
 }
 
 function AppContent() {
@@ -621,23 +691,13 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
   const topClients = [...clients]
     .filter(c => c.snapshots.length > 0)
     .map(c => {
-      const tirFlowKeys = c.tirFlowKeys || [];
-      const latestSnapshot = c.snapshots[c.snapshots.length - 1];
-      const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latestSnapshot?.date)) || 1;
-      const selectedMovFlows = (c.movements || [])
-        .filter(m => (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') && tirFlowKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`))
-        .map(m => ({
-          date: m.concertDate,
-          amount: m.classification === 'DEPOSIT' ? Math.abs(m.monto) : -Math.abs(m.monto),
-          currency: m.moneda || 'ARS',
-        }));
-      const allFlows = [...selectedMovFlows, ...(c.manualFlows || [])];
+      const allFlows = getSelectedExternalFlows(c);
       const perf = calculatePerformance(c.snapshots, c.movements, ratesHistory, currency === 'USD_CCL' ? 'USD' : currency, allFlows);
       return {
         ...c,
         latestValue: c.snapshots[c.snapshots.length - 1]?.totalValue || 0,
         twr: perf.totalReturn,
-        nominalGain: getNominalGainValue(c.snapshots, c.movements, currency, ratesHistory),
+        nominalGain: getNominalGainValue(c, currency, ratesHistory),
       };
     })
     .sort((a, b) => b.latestValue - a.latestValue);
@@ -813,16 +873,12 @@ function ClientsPage({ clients, onNavigate, currency, dispatch, ratesHistory }) 
         <div className="clients-grid">
           {filtered.map(c => {
             const latest = c.snapshots[c.snapshots.length - 1];
-            const cTirKeys = c.tirFlowKeys || [];
-            const cSelectedFlows = (c.movements || [])
-              .filter(m => (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') && cTirKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`))
-              .map(m => ({ date: m.concertDate, amount: m.classification === 'DEPOSIT' ? Math.abs(m.monto) : -Math.abs(m.monto), currency: m.moneda || 'ARS' }));
-            const cAllFlows = [...cSelectedFlows, ...(c.manualFlows || [])];
+            const cAllFlows = getSelectedExternalFlows(c);
             const perf = calculatePerformance(c.snapshots, c.movements, ratesHistory, currency === 'USD_CCL' ? 'USD' : currency, cAllFlows);
             const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latest?.date)) || 1;
             const deposits = getTotalDeposits(c.movements);
             const withdrawals = getTotalWithdrawals(c.movements);
-            const nominalGain = getNominalGainValue(c.snapshots, c.movements, currency, ratesHistory);
+            const nominalGain = getNominalGainValue(c, currency, ratesHistory);
 
             return (
               <div key={c.accountNumber} className="client-card" onClick={() => onNavigate(c.accountNumber)}>
@@ -932,22 +988,14 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, rat
   const latest = client.snapshots[client.snapshots.length - 1];
 
   // Build combined flows: selected movements + manual flows
-  const tirFlowKeys = client.tirFlowKeys || [];
-  const selectedMovFlows = (client.movements || [])
-    .filter(m => (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') && tirFlowKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`))
-    .map(m => ({
-      date: m.concertDate,
-      amount: m.classification === 'DEPOSIT' ? Math.abs(m.monto) : -Math.abs(m.monto),
-      currency: m.moneda || 'ARS',
-    }));
-  const allFlows = [...selectedMovFlows, ...(client.manualFlows || [])];
+  const allFlows = getSelectedExternalFlows(client);
 
   const perf = calculatePerformance(client.snapshots, client.movements, ratesHistory, currency === 'USD_CCL' ? 'USD' : currency, allFlows);
   const totalDeposits = getTotalDeposits(client.movements);
   const totalWithdrawals = getTotalWithdrawals(client.movements);
   const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latest?.date)) || 1;
   const currentPortfolioValue = currency === 'ARS' ? getSnapshotArsValue(latest) : getSnapshotUsdValue(latest);
-  const nominalGain = getNominalGainValue(client.snapshots, client.movements, currency, ratesHistory);
+  const nominalGain = getNominalGainValue(client, currency, ratesHistory);
 
   const convertValue = (val) => {
     if (currency === 'USD' || currency === 'USD_CCL') return val / latestUsdRate;
@@ -1032,7 +1080,7 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, rat
           <div className="stat-value" style={{ fontSize: '20px', color: nominalGain >= 0 ? 'var(--color-success)' : 'var(--color-danger)' }}>
             {formatCurrency(nominalGain, currPrefix)}
           </div>
-          <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '4px' }}>Tenencia final + egresos - ingresos - tenencia inicial</div>
+          <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '4px' }}>Tenencia final + egresos - ingresos - tenencia inicial con flujos seleccionados</div>
         </div>
         <div className="stat-card accent-green">
           <div className="stat-label">TIR Total</div>
@@ -1306,7 +1354,7 @@ function MovementFlowSelector({ client, dispatch, manualInputs, setManualInputs 
     .filter(m => m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL')
     .sort((a, b) => (a.concertDate || '').localeCompare(b.concertDate || ''));
   const tirKeys = client.tirFlowKeys || [];
-  const selectedCount = depositWithdrawals.filter(m => tirKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`)).length;
+  const selectedCount = depositWithdrawals.filter(m => isMovementSelected(m, tirKeys)).length;
 
   return (
     <div className="card" style={{ marginTop: '16px' }}>
@@ -1335,17 +1383,18 @@ function MovementFlowSelector({ client, dispatch, manualInputs, setManualInputs 
             </thead>
             <tbody>
               {depositWithdrawals.map((m, idx) => {
-                const movKey = `${m.concertDate}|${m.movNumber}|${m.monto}`;
-                const isSelected = tirKeys.includes(movKey);
+                const movKey = getMovementFlowKey(m);
+                const aliases = getMovementFlowKeyAliases(m);
+                const isSelected = isMovementSelected(m, tirKeys);
                 const isDep = m.classification === 'DEPOSIT';
                 return (
                   <tr key={`${movKey}_${idx}`}
                     style={{ background: isSelected ? 'rgba(99,102,241,0.08)' : 'transparent', cursor: 'pointer' }}
-                    onClick={() => dispatch({ type: 'TOGGLE_TIR_FLOW', payload: { accountNumber: client.accountNumber, movKey } })}
+                    onClick={() => dispatch({ type: 'TOGGLE_TIR_FLOW', payload: { accountNumber: client.accountNumber, movKey, aliases } })}
                   >
                     <td onClick={(e) => e.stopPropagation()}>
                       <input type="checkbox" checked={isSelected}
-                        onChange={() => dispatch({ type: 'TOGGLE_TIR_FLOW', payload: { accountNumber: client.accountNumber, movKey } })}
+                        onChange={() => dispatch({ type: 'TOGGLE_TIR_FLOW', payload: { accountNumber: client.accountNumber, movKey, aliases } })}
                         style={{ cursor: 'pointer', width: '16px', height: '16px' }} />
                     </td>
                     <td className="text-bold">{m.concertDate}</td>
@@ -1433,10 +1482,7 @@ function ClientRatesTab({ client, ratesHistory, dispatch }) {
   // Dates from snapshots, selected movements, AND manual flows that need rates
   const snapshotDates = (client.snapshots || []).map(s => s.date).filter(Boolean);
   const flowDates = (client.manualFlows || []).map(f => f.date).filter(Boolean);
-  const tirKeys = client.tirFlowKeys || [];
-  const selectedMovDates = (client.movements || [])
-    .filter(m => (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') && tirKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`))
-    .map(m => m.concertDate).filter(Boolean);
+  const selectedMovDates = getSelectedExternalMovements(client).map(m => m.concertDate).filter(Boolean);
   const allDates = [...new Set([...snapshotDates, ...flowDates, ...selectedMovDates])];
   const sortedDates = allDates.sort().reverse();
 
