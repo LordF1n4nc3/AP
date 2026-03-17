@@ -125,6 +125,50 @@ async function loadCloudStateForSession(session, isAdmin) {
   return { clients };
 }
 
+function mergeClientRecords(localClient = {}, cloudClient = {}) {
+  const mergedSnapshotsMap = new Map();
+  [...(cloudClient.snapshots || []), ...(localClient.snapshots || [])].forEach(snapshot => {
+    if (snapshot?.date) {
+      mergedSnapshotsMap.set(snapshot.date, snapshot);
+    }
+  });
+
+  const mergedMovementsMap = new Map();
+  [...(cloudClient.movements || []), ...(localClient.movements || [])].forEach((movement, index) => {
+    const key = movement?.movNumber ? `mov-${movement.movNumber}` : `idx-${index}-${movement?.concertDate || ''}-${movement?.monto || ''}`;
+    mergedMovementsMap.set(key, movement);
+  });
+
+  const mergedManualFlowsMap = new Map();
+  [...(cloudClient.manualFlows || []), ...(localClient.manualFlows || [])].forEach((flow, index) => {
+    const key = flow?.id ? `flow-${flow.id}` : `idx-${index}-${flow?.date || ''}-${flow?.amount || ''}`;
+    mergedManualFlowsMap.set(key, flow);
+  });
+
+  const mergedRatesHistory = { ...(cloudClient.ratesHistory || {}), ...(localClient.ratesHistory || {}) };
+
+  return {
+    ...cloudClient,
+    ...localClient,
+    snapshots: [...mergedSnapshotsMap.values()].sort((a, b) => (a.date || '').localeCompare(b.date || '')),
+    movements: [...mergedMovementsMap.values()].sort((a, b) => (a.concertDate || '').localeCompare(b.concertDate || '')),
+    manualFlows: [...mergedManualFlowsMap.values()].sort((a, b) => (a.date || '').localeCompare(b.date || '')),
+    tirFlowKeys: [...new Set([...(cloudClient.tirFlowKeys || []), ...(localClient.tirFlowKeys || [])])],
+    ratesHistory: mergedRatesHistory,
+  };
+}
+
+function mergeClientsByAccount(localClients = {}, cloudClients = {}) {
+  const allAccounts = new Set([...Object.keys(cloudClients || {}), ...Object.keys(localClients || {})]);
+  const merged = {};
+
+  for (const accountNumber of allAccounts) {
+    merged[accountNumber] = mergeClientRecords(localClients[accountNumber], cloudClients[accountNumber]);
+  }
+
+  return merged;
+}
+
 async function upsertClientToCloud(client, assignedEmailOverride) {
   const rawAssignedEmail = assignedEmailOverride ?? client.assignedEmail ?? '';
   const assignedEmail = rawAssignedEmail.trim().toLowerCase() || null;
@@ -152,6 +196,25 @@ async function upsertClientToCloud(client, assignedEmailOverride) {
   if (dataError) throw dataError;
 }
 
+function getFlowTotalInCurrency(flow, currency, usdRate) {
+  if (!flow) return 0;
+
+  if (currency === 'USD' || currency === 'USD_CCL') {
+    const arsInUsd = usdRate > 0 ? (flow.ars || 0) / usdRate : 0;
+    return arsInUsd + (flow.usd || 0);
+  }
+
+  const usdInArs = (flow.usd || 0) * (usdRate || 1);
+  return (flow.ars || 0) + usdInArs;
+}
+
+function getNominalGainValue(portfolioValue, deposits, withdrawals, currency, usdRate) {
+  const depositsInCurrency = getFlowTotalInCurrency(deposits, currency, usdRate);
+  const withdrawalsInCurrency = getFlowTotalInCurrency(withdrawals, currency, usdRate);
+  const netContributions = depositsInCurrency - withdrawalsInCurrency;
+  return portfolioValue - netContributions;
+}
+
 function AppContent() {
   const { state, dispatch } = useApp();
   const [currentPage, setCurrentPage] = useState('dashboard');
@@ -169,6 +232,11 @@ function AppContent() {
   const [cloudStatus, setCloudStatus] = useState('');
   const [bulkCloudSaving, setBulkCloudSaving] = useState(false);
   const previousSessionEmailRef = useRef(null);
+  const currentClientsRef = useRef(state.clients);
+
+  useEffect(() => {
+    currentClientsRef.current = state.clients;
+  }, [state.clients]);
 
   // Subscribe to Auth status
   useEffect(() => {
@@ -232,7 +300,7 @@ function AppContent() {
         const hasCloudClients = Object.keys(cloudClients || {}).length > 0;
 
         if (hasCloudClients) {
-          dispatch({ type: 'LOAD_STATE', payload: { clients: cloudClients } });
+          dispatch({ type: 'LOAD_STATE', payload: { clients: mergeClientsByAccount(currentClientsRef.current, cloudClients) } });
           setCloudStatus('Datos cargados desde Supabase.');
         } else {
           setCloudStatus('No hay clientes guardados en Supabase.');
@@ -518,6 +586,15 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
     .filter(c => c.snapshots.length > 0)
     .map(c => {
       const tirFlowKeys = c.tirFlowKeys || [];
+      const latestSnapshot = c.snapshots[c.snapshots.length - 1];
+      const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latestSnapshot?.date)) || 1;
+      const deposits = getTotalDeposits(c.movements);
+      const withdrawals = getTotalWithdrawals(c.movements);
+      const portfolioValue = currency === 'ARS'
+        ? (latestSnapshot?.totalValue || 0) + ((latestSnapshot?.availableDolares || 0) * latestUsdRate)
+        : latestUsdRate > 0
+          ? ((latestSnapshot?.totalValue || 0) + ((latestSnapshot?.availableDolares || 0) * latestUsdRate)) / latestUsdRate
+          : (latestSnapshot?.totalValue || 0);
       const selectedMovFlows = (c.movements || [])
         .filter(m => (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') && tirFlowKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`))
         .map(m => ({
@@ -531,6 +608,7 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
         ...c,
         latestValue: c.snapshots[c.snapshots.length - 1]?.totalValue || 0,
         twr: perf.totalReturn,
+        nominalGain: getNominalGainValue(portfolioValue, deposits, withdrawals, currency, latestUsdRate),
       };
     })
     .sort((a, b) => b.latestValue - a.latestValue);
@@ -600,6 +678,7 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
                   <th>Cliente</th>
                   <th>Cuenta</th>
                   <th className="text-right">Cartera ({currLabel})</th>
+                  <th className="text-right">Ganancia Neta</th>
                   <th className="text-right">Rendimiento</th>
                   <th className="text-right">Posiciones</th>
                   <th></th>
@@ -612,6 +691,9 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
                     <td style={{ fontFamily: 'monospace', fontSize: '13px' }}>{c.accountNumber}</td>
                     <td className="text-right text-bold">
                       {formatCurrency(convertValue(c.latestValue), currPrefix)}
+                    </td>
+                    <td className={`text-right ${c.nominalGain >= 0 ? 'text-positive' : 'text-negative'}`}>
+                      {formatCurrency(c.nominalGain, currPrefix)}
                     </td>
                     <td className={`text-right ${c.twr !== null ? (c.twr >= 0 ? 'text-positive' : 'text-negative') : ''}`}>
                       {c.twr !== null ? formatPercent(c.twr) : (
@@ -711,6 +793,8 @@ function ClientsPage({ clients, onNavigate, currency, dispatch, ratesHistory }) 
             const deposits = getTotalDeposits(c.movements);
             const withdrawals = getTotalWithdrawals(c.movements);
             const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latest?.date)) || 1;
+            const portfolioValue = currency === 'ARS' ? getSnapshotArsValue(latest) : getSnapshotUsdValue(latest);
+            const nominalGain = getNominalGainValue(portfolioValue, deposits, withdrawals, currency, latestUsdRate);
 
             return (
               <div key={c.accountNumber} className="client-card" onClick={() => onNavigate(c.accountNumber)}>
@@ -743,6 +827,12 @@ function ClientsPage({ clients, onNavigate, currency, dispatch, ratesHistory }) 
                     <div className="client-stat-label">TIR Anualizada</div>
                     <div className="client-stat-value" style={{ color: perf.annualizedTIR !== null ? (perf.annualizedTIR >= 0 ? 'var(--color-success)' : 'var(--color-danger)') : 'var(--text-muted)' }}>
                       {perf.annualizedTIR !== null ? formatPercent(perf.annualizedTIR) : 'N/A'}
+                    </div>
+                  </div>
+                  <div className="client-stat">
+                    <div className="client-stat-label">Ganancia Neta</div>
+                    <div className="client-stat-value" style={{ color: nominalGain >= 0 ? 'var(--color-success)' : 'var(--color-danger)' }}>
+                      {formatCurrency(nominalGain, currPrefix)}
                     </div>
                   </div>
                   <div className="client-stat">
@@ -828,6 +918,8 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, rat
   const totalDeposits = getTotalDeposits(client.movements);
   const totalWithdrawals = getTotalWithdrawals(client.movements);
   const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latest?.date)) || 1;
+  const currentPortfolioValue = currency === 'ARS' ? getSnapshotArsValue(latest) : getSnapshotUsdValue(latest);
+  const nominalGain = getNominalGainValue(currentPortfolioValue, totalDeposits, totalWithdrawals, currency, latestUsdRate);
 
   const convertValue = (val) => {
     if (currency === 'USD' || currency === 'USD_CCL') return val / latestUsdRate;
@@ -904,8 +996,15 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, rat
         <div className="stat-card accent-blue">
           <div className="stat-label">Cartera ({currLabel})</div>
           <div className="stat-value" style={{ fontSize: '20px' }}>
-            {formatCurrency(currency === 'ARS' ? getSnapshotArsValue(latest) : getSnapshotUsdValue(latest), currPrefix)}
+            {formatCurrency(currentPortfolioValue, currPrefix)}
           </div>
+        </div>
+        <div className="stat-card accent-amber">
+          <div className="stat-label">Ganancia Neta</div>
+          <div className="stat-value" style={{ fontSize: '20px', color: nominalGain >= 0 ? 'var(--color-success)' : 'var(--color-danger)' }}>
+            {formatCurrency(nominalGain, currPrefix)}
+          </div>
+          <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '4px' }}>Cartera menos aportes netos</div>
         </div>
         <div className="stat-card accent-green">
           <div className="stat-label">TIR Total</div>
