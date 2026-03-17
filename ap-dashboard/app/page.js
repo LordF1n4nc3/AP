@@ -221,7 +221,20 @@ function getSnapshotValueInDisplayCurrency(snapshot, currency, ratesHistory) {
   return totalArs;
 }
 
-function getNominalGainValue(snapshots, deposits, withdrawals, currency, ratesHistory) {
+function getMovementTotalsInRange(movements, startDate, endDate) {
+  const relevantMovements = (movements || []).filter(m => {
+    if (!m?.concertDate) return false;
+    if (m.classification !== 'DEPOSIT' && m.classification !== 'WITHDRAWAL') return false;
+    return m.concertDate >= startDate && m.concertDate <= endDate;
+  });
+
+  return {
+    deposits: getTotalDeposits(relevantMovements),
+    withdrawals: getTotalWithdrawals(relevantMovements),
+  };
+}
+
+function getNominalGainValue(snapshots, movements, currency, ratesHistory) {
   if (!snapshots || snapshots.length === 0) return 0;
 
   const sortedSnapshots = [...snapshots].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
@@ -230,6 +243,7 @@ function getNominalGainValue(snapshots, deposits, withdrawals, currency, ratesHi
   const firstSnapshotValue = getSnapshotValueInDisplayCurrency(firstSnapshot, currency, ratesHistory);
   const lastSnapshotValue = getSnapshotValueInDisplayCurrency(lastSnapshot, currency, ratesHistory);
   const lastUsdRate = getMepRate(getRateForDate(ratesHistory, lastSnapshot?.date)) || 1;
+  const { deposits, withdrawals } = getMovementTotalsInRange(movements, firstSnapshot.date, lastSnapshot.date);
   const depositsInCurrency = getFlowTotalInCurrency(deposits, currency, lastUsdRate);
   const withdrawalsInCurrency = getFlowTotalInCurrency(withdrawals, currency, lastUsdRate);
 
@@ -610,8 +624,6 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
       const tirFlowKeys = c.tirFlowKeys || [];
       const latestSnapshot = c.snapshots[c.snapshots.length - 1];
       const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latestSnapshot?.date)) || 1;
-      const deposits = getTotalDeposits(c.movements);
-      const withdrawals = getTotalWithdrawals(c.movements);
       const selectedMovFlows = (c.movements || [])
         .filter(m => (m.classification === 'DEPOSIT' || m.classification === 'WITHDRAWAL') && tirFlowKeys.includes(`${m.concertDate}|${m.movNumber}|${m.monto}`))
         .map(m => ({
@@ -625,7 +637,7 @@ function DashboardPage({ clients, totalAUM, totalClients, onNavigate, currency, 
         ...c,
         latestValue: c.snapshots[c.snapshots.length - 1]?.totalValue || 0,
         twr: perf.totalReturn,
-        nominalGain: getNominalGainValue(c.snapshots, deposits, withdrawals, currency, ratesHistory),
+        nominalGain: getNominalGainValue(c.snapshots, c.movements, currency, ratesHistory),
       };
     })
     .sort((a, b) => b.latestValue - a.latestValue);
@@ -807,10 +819,10 @@ function ClientsPage({ clients, onNavigate, currency, dispatch, ratesHistory }) 
               .map(m => ({ date: m.concertDate, amount: m.classification === 'DEPOSIT' ? Math.abs(m.monto) : -Math.abs(m.monto), currency: m.moneda || 'ARS' }));
             const cAllFlows = [...cSelectedFlows, ...(c.manualFlows || [])];
             const perf = calculatePerformance(c.snapshots, c.movements, ratesHistory, currency === 'USD_CCL' ? 'USD' : currency, cAllFlows);
+            const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latest?.date)) || 1;
             const deposits = getTotalDeposits(c.movements);
             const withdrawals = getTotalWithdrawals(c.movements);
-            const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latest?.date)) || 1;
-            const nominalGain = getNominalGainValue(c.snapshots, deposits, withdrawals, currency, ratesHistory);
+            const nominalGain = getNominalGainValue(c.snapshots, c.movements, currency, ratesHistory);
 
             return (
               <div key={c.accountNumber} className="client-card" onClick={() => onNavigate(c.accountNumber)}>
@@ -935,7 +947,7 @@ function ClientDetailPage({ client, tab, setTab, onBack, currency, dispatch, rat
   const totalWithdrawals = getTotalWithdrawals(client.movements);
   const latestUsdRate = getMepRate(getRateForDate(ratesHistory, latest?.date)) || 1;
   const currentPortfolioValue = currency === 'ARS' ? getSnapshotArsValue(latest) : getSnapshotUsdValue(latest);
-  const nominalGain = getNominalGainValue(client.snapshots, totalDeposits, totalWithdrawals, currency, ratesHistory);
+  const nominalGain = getNominalGainValue(client.snapshots, client.movements, currency, ratesHistory);
 
   const convertValue = (val) => {
     if (currency === 'USD' || currency === 'USD_CCL') return val / latestUsdRate;
