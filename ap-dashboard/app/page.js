@@ -283,7 +283,10 @@ function getSnapshotValueInDisplayCurrency(snapshot, currency, ratesHistory) {
 
 function getFlowTotalsInRange(flows, startDate, endDate, currency, ratesHistory) {
   return (flows || []).reduce((acc, flow) => {
-    if (!flow?.date || flow.date < startDate || flow.date > endDate) {
+    // We keep nominal gain aligned with the TIR window:
+    // flows on the exact snapshot dates are assumed to already be reflected
+    // in the valuation file and would otherwise be double-counted.
+    if (!flow?.date || flow.date <= startDate || flow.date >= endDate) {
       return acc;
     }
 
