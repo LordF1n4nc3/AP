@@ -372,7 +372,7 @@ function AppContent() {
       else setAuthError('¡Chequeá tu email para confirmar la cuenta!');
     } else {
       const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
-      if (error) setAuthError('Email o contraseña incorrectos');
+      if (error) setAuthError(`Email o contraseña incorrectos (${error.message})`);
     }
     setAuthLoading(false);
   };
